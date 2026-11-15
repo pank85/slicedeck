@@ -61,7 +61,7 @@ A pairing is a complete statement about a printer, not a patch: a slot the body 
 
 | Method | Path | Purpose | Notable statuses |
 |---|---|---|---|
-| POST | `/api/upload` | multipart `file` (`.stl` `.3mf` `.obj` `.zip`) + optional `output_name`, form field `support_fins` ignored → stage the job. A zip of several models also returns `jobs` | 200 `{id,status:"awaiting_confirm"}` (nothing queued) · 400 unsupported suffix / invalid `output_name` · **409 `no_printer_profile`** · 413 larger than `MAX_UPLOAD_MB` (from `Content-Length`, the streaming count, or the combined uncompressed models in a zip) · archives: `ArchiveError.status`, 400 or 413 |
+| POST | `/api/upload` | multipart `file` (`.stl` `.3mf` `.obj` `.zip`) + optional `output_name`, form field `support_fins` ignored → stage the job(s). A multi-job upload also returns `jobs` and `jobGroup` | 200 `{id,status:"awaiting_confirm"}` (nothing queued) · 400 unsupported suffix / invalid `output_name` · **409 `no_printer_profile`** · 413 larger than `MAX_UPLOAD_MB` (from `Content-Length`, the streaming count, or the combined uncompressed models in a zip) · archives: `ArchiveError.status`, 400 or 413 |
 | GET | `/api/jobs` | job list, newest first (every `job.json` that parses) | 200 |
 | GET | `/api/jobs/{jid}` | one job: status, stats, error, `threemf`, `archive`, and for a finned job `original`, `fins`, `support_fins` | 200 · 404 (`jid` must be 12 lowercase hex) |
 | GET | `/api/jobs/{jid}/gcode` | download the sliced gcode | 200 file · 409 `not sliced yet` · 404 |
@@ -73,16 +73,33 @@ A pairing is a complete statement about a printer, not a patch: a slot the body 
 on disk (`main.py:997`). `output_name` rules: no path separators, not a Windows reserved device name,
 at most 60 characters, `[A-Za-z0-9 ._-]` only (`_validated_output_name`, `main.py:891`).
 
-A `.zip` is extracted fail-closed. Every printable member (`.stl`, `.3mf`, `.obj`, any case) becomes
-its own `awaiting_confirm` job; non-models are skipped, not staged. Nothing is queued. One model keeps
-today's body (no `jobs` key) and an unsuffixed `output_name`. Several models add `jobs`: the same N
-result objects, including the first, with no nested `jobs` and no `queue_position`. Names are the
-explicit `output_name` or the member stem, plus `-01`, `-02`, …, truncated so the result is at most 60
-characters. The original zip is kept only on the first job (`upload/<zip name>`); each job stores its
-own model copy, `model_bytes`, and `archive.member`. `upload_bytes` is the zip size on every job.
-3MF members are matched in that same order; each job's pins and snapshot are from its own turn, and
-the dashboard selection ends on the last 3MF. `MAX_UPLOAD_MB` bounds the upload and the combined
-uncompressed size of the extracted models. Confirm each job with `POST /api/jobs/{jid}/slice`.
+ZIPs and loose-model 3MF wrappers are extracted fail-closed. A native 3MF is instead retained intact:
+its explicit, contiguous 1-based plate declarations produce one job per plate. A native project
+without plate declarations stays one whole-build job, even with multiple build objects. A native
+project within a container is expanded in place; nested loose-model wrappers are rejected. ZIP member
+order is followed by ascending plate order. Non-model entries are skipped. At most 64 final jobs may
+result from one upload; exceeding this cap returns 413. Malformed or unsafe archives/layouts return
+400, and byte/count limits return 413. The entire batch is published atomically, with nothing queued.
+
+Each explicitly scoped job includes `plate: {index, name, count}` in its persisted record, individual
+upload result, job read and listing; `index` is the positive Orca `--slice` selector, `name` may be
+null, and `count` is the number of plates in that source project. Generic/unscoped jobs omit `plate`
+and retain `--slice 0`. A multi-job upload adds the identical descriptor
+`jobGroup: {id, name, job_ids}` to every member: `id` is 12 lowercase hex characters, `name` is the
+original upload name, and `job_ids` lists original members in deterministic order. It is immutable
+provenance, not a new endpoint or queue; deleting a member does not change surviving descriptors.
+`GET /api/jobs` remains flat.
+
+A singleton retains the legacy body (no `jobs` or `jobGroup`) and an unsuffixed `output_name`.
+A batch returns the first result at top level plus `jobs`, the same N individual result objects with
+no nested `jobs` or `queue_position`. Names are the explicit `output_name` or member stem, plus
+`-01`, `-02`, …, truncated to 60 characters. The original outer container is retained only with the
+first job under `upload/<name>`, or `archive/<name>` on a basename collision. Each job has its own
+complete model copy, `model_bytes`, pins and snapshot; container jobs also keep `archive.member`.
+`upload_bytes` is the outer upload size. Preparation follows the flattened order, so each job pins its
+own turn and the dashboard selection ends on the last 3MF. `MAX_UPLOAD_MB` bounds the upload,
+extracted model bytes and each uncompressed native 3MF. Confirm each member separately with
+`POST /api/jobs/{jid}/slice`; successful CLI output must contain exactly one G-code file.
 
 A job object (`GET /api/jobs`, `GET /api/jobs/{jid}` and the SSE stream) also carries the slicing
 decisions: `auto_orient`, `auto_orient_used` (true when orient actually ran, e.g. because a shrink
@@ -95,7 +112,8 @@ Job reads add `reslice: {eligible, reason}`; only `sliced` or `failed` jobs with
 STL, OBJ or 3MF model are eligible. A reslice child also has `staging`, with `settings_editable`,
 `preview_available`, `resize_available` and `reason`; geometry results also include `unit` and `size`. These
 are computed on reads. Printed jobs remain `sliced`. A child is independent of its source and uses a
-copy of its current canonical model, not the ZIP or the source's prepared slicer input.
+copy of its current canonical model, not the ZIP or the source's prepared slicer input. It retains
+an explicit source `plate` selector but does not join the source's upload `jobGroup`.
 
 | Method | Path | Request and result |
 |---|---|---|
@@ -114,6 +132,10 @@ datadir or embedded object overrides. 3MF identity is prepared from the child's 
 unreadable identity settings fail preflight. Reslice confirmation rejects shrink-to-fit for 3MF or
 fins, and fin jobs suppress auto-orientation. Preview and resize are bounded and may be unavailable
 for otherwise sliceable inputs; arbitrary external-reference 3MF preview/resize is unsupported.
+For `plate.count > 1`, fins, resize/scale and scene preview return 409 before changing files, pins,
+revision or queue; `staging.preview_available` and `staging.resize_available` are false with an
+explanation. Reset may restore the unchanged baseline and still reports preview unavailable.
+Settings-only confirmation remains available and preserves the plate selector.
 
 Closing retains a staged child, and no slice or print is started until explicitly requested. Drafts
 are protected from age pruning, but individual and bulk delete can remove them. Queued/slicing jobs
@@ -124,7 +146,8 @@ and jobs being uploaded for printing cannot be deleted. A source may be deleted 
 
 Opt-in designed-in supports, off by default. Every successful `POST /api/upload` **stages** the job
 with `status: "awaiting_confirm"` (the form field `support_fins` is ignored and does not run the CLI).
-Support fins run at slice time when requested via `POST /api/jobs/{jid}/slice` with `support_fins: true`.
+Support fins run at slice time when requested via `POST /api/jobs/{jid}/slice` with `support_fins: true`;
+plate-scoped jobs from multi-plate projects reject this with 409.
 The status list is therefore `queued` · `slicing` · `awaiting_confirm` · `sliced` · `failed`;
 `awaiting_confirm` is deliberately **not** an active status (it can be deleted like a
 finished job) but `prune()` keeps it, so an open staged job is never collected.

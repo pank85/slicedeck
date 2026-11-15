@@ -819,6 +819,72 @@ input[type=checkbox]{
   font-weight:600;
 }
 #jobs{ display:grid; gap:12px; }
+.job-group{
+  display:grid;
+  gap:10px;
+  min-width:0;
+  padding:clamp(10px,1.6vw,14px);
+  border:1px solid var(--color-border);
+  border-radius:var(--radius-md);
+  background:rgba(16,20,29,.55);
+}
+.job-group-head{
+  display:flex;
+  flex-wrap:wrap;
+  align-items:center;
+  justify-content:space-between;
+  gap:8px 12px;
+  min-width:0;
+  padding:2px 4px 4px;
+}
+.job-group-title{
+  display:flex;
+  flex-wrap:wrap;
+  align-items:baseline;
+  gap:6px 10px;
+  min-width:0;
+  font-size:var(--text-sm);
+  font-weight:620;
+  color:var(--color-foreground);
+}
+.job-group-label{
+  font-size:var(--text-xs);
+  font-weight:600;
+  text-transform:uppercase;
+  letter-spacing:.06em;
+  color:var(--color-info);
+}
+.job-group-name{
+  color:#EAF2FF;
+  overflow-wrap:anywhere;
+}
+.job-group-count{
+  display:inline-flex;
+  align-items:center;
+  padding:2px 9px;
+  border:1px solid var(--color-border);
+  border-radius:var(--radius-pill);
+  background:rgba(148,163,184,.08);
+  color:var(--color-muted-foreground);
+  font-size:var(--text-xs);
+  white-space:nowrap;
+}
+.job-group-list{
+  display:grid;
+  gap:10px;
+  min-width:0;
+}
+.job-plate{
+  display:inline-flex;
+  align-items:center;
+  padding:2px 8px;
+  border:1px solid rgba(56,189,248,.26);
+  border-radius:var(--radius-pill);
+  background:rgba(56,189,248,.09);
+  color:#BAE6FD;
+  font-size:var(--text-xs);
+  font-weight:500;
+}
 .job{
   position:relative;
   display:grid;
@@ -1174,6 +1240,7 @@ input[type=checkbox]{
   .view > h1{ font-size:1.5rem; }
   .job-actions .btn{ flex:1 1 calc(50% - 8px); }
   .job-actions .btn-primary{ flex-basis:100%; }
+  .job-group{ padding:10px; }
   .form-actions .btn{ flex:1 1 calc(50% - 8px); }
   .form-actions .btn-primary{ margin-left:0; flex-basis:100%; }
   .dialog{ border-radius:var(--radius-lg); }
@@ -2228,7 +2295,7 @@ async function upload(file) {
       setUploadWait(null);
       setPrintOptions(null);
       await refresh();
-      toast(`Found ${createdJobs.length} printable models in ${file.name}; saved ${createdJobs.length} jobs. Nothing sliced. Open Print options for each job.`, 6000);
+      toast(`Saved ${createdJobs.length} jobs from ${file.name} (models/plates). Nothing sliced. Open Print options for each job.`, 6000);
       const jobsTitle = $("#jobsTitle");
       if (jobsTitle) jobsTitle.focus();
       return;
@@ -2524,8 +2591,20 @@ function finsSummary(j) {
   return parts.join(" · ") || "added";
 }
 
+function formatPlateLabel(plate) {
+  if (!plate || typeof plate !== "object") return "";
+  const hasIndex = Number.isInteger(plate.index) && plate.index > 0;
+  const hasCount = Number.isInteger(plate.count) && plate.count > 1;
+  const name = typeof plate.name === "string" ? plate.name.trim() : "";
+  if (!hasIndex && !name) return "";
+  let text = hasIndex ? (hasCount ? `Plate ${plate.index} of ${plate.count}` : `Plate ${plate.index}`) : "Plate";
+  if (name) text += `: ${name}`;
+  return text;
+}
+
 function renderJobBody(j, withWait = true) {
   const s = j.stats || {};
+  const plateLabel = formatPlateLabel(j.plate);
   const out = j.output_name ? `<span class="mono" title="sliced as">→ ${esc(j.output_name)}.gcode</span>` : "";
   const active = isSlicing(j.status) && !j.error;
   const label = SLICE_LABELS[j.status] || SLICE_LABELS.queued;
@@ -2551,6 +2630,7 @@ function renderJobBody(j, withWait = true) {
     <p class="job-name mono">${esc(j.filename)}</p>
     <p class="job-meta">
       <span class="chip chip-${esc(j.status)}">${esc(j.status)}</span>
+      ${plateLabel ? `<span class="job-plate">${esc(plateLabel)}</span>` : ""}
       <span class="mono">${fmtBytes(j.upload_bytes)}</span>
       <span>${fmtDate(j.created)}</span>
       ${out}
@@ -2671,6 +2751,79 @@ function setUploadLatest(job) {
   remove.setAttribute("aria-label", `Delete ${name}`);
 }
 
+function renderJobGroup(group, groupIdx) {
+  const orderedMembers = group.members.slice();
+  if (Array.isArray(group.job_ids) && group.job_ids.length) {
+    const order = new Map();
+    group.job_ids.forEach((id, idx) => {
+      if (typeof id === "string" && !order.has(id)) order.set(id, idx);
+    });
+    orderedMembers.sort((a, b) => {
+      const ia = order.has(a.job.id) ? order.get(a.job.id) : Number.MAX_SAFE_INTEGER;
+      const ib = order.has(b.job.id) ? order.get(b.job.id) : Number.MAX_SAFE_INTEGER;
+      if (ia !== ib) return ia - ib;
+      return a.index - b.index;
+    });
+  }
+  const liveCount = orderedMembers.length;
+  const originalCount = Array.isArray(group.job_ids) && group.job_ids.length > liveCount ? group.job_ids.length : null;
+  const countText = originalCount !== null
+    ? `${liveCount} of ${originalCount} jobs`
+    : `${liveCount} ${liveCount === 1 ? "job" : "jobs"}`;
+  const groupName = group.name || "Uploaded batch";
+  const headingId = `job-group-${groupIdx}`;
+  return `<section class="job-group" aria-labelledby="${headingId}" data-group-id="${esc(group.id)}">
+    <div class="job-group-head">
+      <h3 class="job-group-title" id="${headingId}">
+        <span class="job-group-label">Upload group</span>
+        <span class="job-group-name mono">${esc(groupName)}</span>
+      </h3>
+      <span class="job-group-count mono">${esc(countText)}</span>
+    </div>
+    <div class="job-group-list">
+      ${orderedMembers.map(entry => renderJobRow(entry.job)).join("")}
+    </div>
+  </section>`;
+}
+
+function renderJobsList(jobs) {
+  const groupsById = new Map();
+  const items = [];
+  jobs.forEach((j, index) => {
+    const rawGroup = j && j.jobGroup && typeof j.jobGroup === "object" ? j.jobGroup : null;
+    const groupId = rawGroup && typeof rawGroup.id === "string" && rawGroup.id ? rawGroup.id : "";
+    if (groupId) {
+      let group = groupsById.get(groupId);
+      if (!group) {
+        group = {
+          id: groupId,
+          name: typeof rawGroup.name === "string" && rawGroup.name ? rawGroup.name : "",
+          job_ids: Array.isArray(rawGroup.job_ids) ? rawGroup.job_ids : null,
+          members: []
+        };
+        groupsById.set(groupId, group);
+        items.push({ type: "group", group });
+      } else {
+        if (!group.name && typeof rawGroup.name === "string" && rawGroup.name) {
+          group.name = rawGroup.name;
+        }
+        if (!group.job_ids && Array.isArray(rawGroup.job_ids)) {
+          group.job_ids = rawGroup.job_ids;
+        }
+      }
+      group.members.push({ job: j, index });
+    } else {
+      items.push({ type: "job", job: j });
+    }
+  });
+  let groupIdx = 0;
+  return items.map(item => (
+    item.type === "group"
+      ? renderJobGroup(item.group, groupIdx++)
+      : renderJobRow(item.job)
+  )).join("");
+}
+
 async function refresh() {
   if (pollPaused()) return;
   const box = $("#jobs"), count = $("#jobCount"), delAll = $("#btnDeleteAll");
@@ -2697,7 +2850,7 @@ async function refresh() {
       box.innerHTML = `<p class="empty-line">No jobs yet. Drop a model above to slice it.</p>`;
       return;
     }
-    box.innerHTML = jobs.map(renderJobRow).join("");
+    box.innerHTML = renderJobsList(jobs);
   } catch (e) {
     box.innerHTML = `<p class="err">Could not load jobs: ${esc(e.message)}</p>`;
     /* the row list says the load failed, so the card must not keep asserting a live slice */

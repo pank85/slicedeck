@@ -488,3 +488,141 @@ def test_confirm_3mf_rewrites_current_geometry_and_rejects_bad_settings(setup, m
         assert identity['printer_settings_id'] == ['machine']
         assert identity['print_settings_id'] == ['process (portal options)']
     assert not main.CONFIG.profile_file.exists()
+
+
+def _scoped_source(jobs, three_mf_bytes, status='sliced'):
+    jid = source(jobs, status=status, filename='part.3mf')
+    layout = (b'<config><plate><metadata key="plater_id" value="1"/></plate>'
+              b'<plate><metadata key="plater_id" value="2"/></plate></config>')
+    blob = three_mf_bytes(model_members=False, extra={'Metadata/model_settings.config': layout})
+    (jobs / jid / 'upload' / 'part.3mf').write_bytes(blob)
+    main.write_job(jid, plate={'index': 2, 'name': 'Top', 'count': 2},
+                   jobGroup={'id': 'abcdef012345', 'name': 'part.3mf', 'job_ids': ['other', jid]})
+    return jid, blob, layout
+
+
+def _bytes_under(directory):
+    return {p.relative_to(directory).as_posix(): p.read_bytes()
+            for p in directory.rglob('*') if p.is_file()}
+
+
+def test_single_explicit_plate_still_allows_geometry_editing(setup, zip_bytes):
+    client, jobs, _ = setup
+    jid = source(jobs, filename='part.3mf')
+    geometry = (b'<model xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">'
+                b'<resources><object id="1" type="model"><mesh><vertices>'
+                b'<vertex x="0" y="0" z="0"/><vertex x="1" y="0" z="0"/>'
+                b'<vertex x="0" y="1" z="0"/></vertices>'
+                b'<triangles><triangle v1="0" v2="1" v3="2"/></triangles>'
+                b'</mesh></object></resources><build><item objectid="1"/></build></model>')
+    layout = b'<config><plate><metadata key="plater_id" value="1"/></plate></config>'
+    (jobs / jid / 'upload' / 'part.3mf').write_bytes(zip_bytes({
+        '3D/3dmodel.model': geometry, 'Metadata/model_settings.config': layout}))
+    plate = {'index': 1, 'name': 'Only', 'count': 1}
+    main.write_job(jid, plate=plate)
+    child = fork(client, jid).json()
+    cid = child['id']
+    assert child['plate'] == plate
+    assert child['staging']['preview_available'] and child['staging']['resize_available']
+    assert client.get(f'/api/jobs/{cid}/preview').status_code == 200
+    scaled = client.post(f'/api/jobs/{cid}/scale', json={'revision': 0, 'width': 2})
+    assert scaled.status_code == 200, scaled.text
+    with zipfile.ZipFile(jobs / cid / 'upload' / 'part.3mf') as archive:
+        assert archive.read('Metadata/model_settings.config') == layout
+    reset = client.post(f'/api/jobs/{cid}/scale/reset', json={'revision': 1})
+    assert reset.status_code == 200, reset.text
+    assert client.get(f'/api/jobs/{cid}').json()['plate'] == plate
+
+
+def test_multiplate_confirm_rejects_fins_and_resize_before_pin_changes(setup, three_mf_bytes, monkeypatch):
+    import queue
+    client, jobs, _ = setup
+    monkeypatch.setattr(main, 'job_queue', queue.Queue())
+    jid, _, _ = _scoped_source(jobs, three_mf_bytes, status='awaiting_confirm')
+    pinned = jobs / jid / 'pinned'
+    pinned.mkdir()
+    (pinned / 'process.json').write_bytes(b'original pinned process')
+    before = _bytes_under(jobs / jid)
+    for body in ({'support_fins': True, 'options': {'supports': True}},
+                 {'resize': {'max_height': 10}, 'options': {'supports': True}}):
+        response = client.post(f'/api/jobs/{jid}/slice', json=body)
+        assert response.status_code == 409 and 'multi-plate' in response.json()['detail']
+        assert _bytes_under(jobs / jid) == before and main.job_queue.empty()
+
+
+def test_multiplate_reslice_rejects_geometry_edits_without_mutation(setup, three_mf_bytes, monkeypatch):
+    import queue
+    client, jobs, _ = setup
+    monkeypatch.setattr(main, 'job_queue', queue.Queue())
+    jid, blob, _ = _scoped_source(jobs, three_mf_bytes)
+    response = fork(client, jid)
+    assert response.status_code == 201
+    child = response.json()
+    cid = child['id']
+    assert child['plate'] == {'index': 2, 'name': 'Top', 'count': 2}
+    assert 'jobGroup' not in child
+    assert not child['staging']['preview_available'] and not child['staging']['resize_available']
+    assert 'multi-plate' in child['staging']['reason']
+    pinned = jobs / cid / 'pinned'
+    pinned.mkdir()
+    (pinned / 'process.json').write_bytes(b'previous pins')
+    before = _bytes_under(jobs / cid)
+    requests = [
+        ('get', f'/api/jobs/{cid}/preview', None),
+        ('post', f'/api/jobs/{cid}/scale', {'revision': 0, 'factor': 2}),
+        ('patch', f'/api/jobs/{cid}/settings', {'revision': 0, 'pending_support_fins': True,
+                                                'options': {'supports': True}}),
+    ]
+    for method, url, body in requests:
+        result = getattr(client, method)(url, **({'json': body} if body is not None else {}))
+        assert result.status_code == 409 and 'multi-plate' in result.json()['detail']
+        assert _bytes_under(jobs / cid) == before and main.job_queue.empty()
+    # Restoring an unchanged baseline is safe, but must not claim scene preview is available.
+    reset = client.post(f'/api/jobs/{cid}/scale/reset', json={'revision': 0})
+    assert reset.status_code == 200, reset.text
+    assert reset.json()['revision'] == 1 and not reset.json()['preview_available']
+    assert (jobs / cid / 'upload' / 'part.3mf').read_bytes() == blob
+    assert main.read_job(cid)['plate'] == child['plate'] and main.job_queue.empty()
+
+
+def test_reslice_plate_selector_survives_source_deletion_and_reconfirmation(
+        setup, three_mf_bytes, monkeypatch):
+    import io
+    import queue
+    from types import SimpleNamespace
+    client, jobs, datadir = setup
+    monkeypatch.setattr(main, 'job_queue', queue.Queue())
+    monkeypatch.setattr(main, 'SLICED', jobs.parent / 'sliced')
+    jid, blob, layout = _scoped_source(jobs, three_mf_bytes)
+    child = fork(client, jid).json()
+    cid = child['id']
+    assert client.delete(f'/api/jobs/{jid}').status_code == 200
+    assert (jobs / cid / 'baseline').read_bytes() == blob
+    preset_dir = datadir / 'plate-reslice'
+    preset_dir.mkdir()
+    refs = {}
+    for kind in ('machine', 'process', 'filament'):
+        path = preset_dir / f'{kind}.json'
+        data = {'name': kind, 'type': kind}
+        if kind == 'process':
+            data['compatible_printers'] = ['machine']
+        path.write_text(json.dumps(data))
+        refs[kind] = path.relative_to(datadir).as_posix()
+    assert client.patch(f'/api/jobs/{cid}/settings', json={'revision': 0, 'profile': refs}).status_code == 200
+    result = client.post(f'/api/jobs/{cid}/slice', json={'revision': 1})
+    assert result.status_code == 200, result.text
+    assert main.job_queue.get_nowait() == cid and main.job_queue.empty()
+    job = main.read_job(cid)
+    assert job['revision'] == 2 and job['plate'] == child['plate'] and 'jobGroup' not in job
+    with zipfile.ZipFile(io.BytesIO((jobs / cid / 'upload' / job['slicer_input']).read_bytes())) as z:
+        assert z.read('Metadata/model_settings.config') == layout
+    observed = {}
+    def slicer(cmd, **kwargs):
+        observed['cmd'] = cmd
+        (Path(kwargs['cwd']) / 'out' / 'plate_2.gcode').write_text('; generated')
+        return SimpleNamespace(returncode=0, stdout='', stderr='')
+    monkeypatch.setattr(main.subprocess, 'run', slicer)
+    main.run_slice(cid)
+    assert observed['cmd'][observed['cmd'].index('--slice') + 1] == '2'
+    assert Path(observed['cmd'][-1]).name == job['slicer_input']
+    assert main.read_job(cid)['status'] == 'sliced'

@@ -10,8 +10,9 @@ run through ``supportfins.fin_model``, and the 3MF they write is read back with
 it also runs on a dev host. Use a fixture that actually grows fins (``overhang.stl``);
 ``cube.stl`` is shallow enough that the CLI legitimately returns zero fins.
 
-Exits 0 and prints a single line starting ``smoke: ok`` on success; exits 1 with
-diagnostics on any failure. Runnable as uid 1000.
+The normal mode also generates a two-plate native project and verifies that real Orca
+selectors produce the expected distinct layer counts. Each successful check prints a line
+starting ``smoke: ok``; failures exit 1 with diagnostics. Runnable as uid 1000.
 """
 from __future__ import annotations
 
@@ -19,6 +20,7 @@ import argparse
 import json
 import os
 import shutil
+import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -90,6 +92,76 @@ def check_fins(stl: Path, workdir: Path, app_dir: str) -> None:
           f"report={result.get('report')!r}")
 
 
+def _write_box(path: Path, width: float, depth: float, height: float) -> None:
+    """Write a closed binary STL; the large footprint forces separate arranged plates."""
+    vertices = [(0, 0, 0), (width, 0, 0), (width, depth, 0), (0, depth, 0),
+                (0, 0, height), (width, 0, height), (width, depth, height),
+                (0, depth, height)]
+    faces = [(0, 2, 1), (0, 3, 2), (4, 5, 6), (4, 6, 7), (0, 1, 5), (0, 5, 4),
+             (1, 2, 6), (1, 6, 5), (2, 3, 7), (2, 7, 6), (3, 0, 4), (3, 4, 7)]
+    with path.open("wb") as handle:
+        handle.write(b"print-portal plate smoke".ljust(80, b"\0"))
+        handle.write(struct.pack("<I", len(faces)))
+        for face in faces:
+            values = [0.0, 0.0, 0.0]
+            for index in face:
+                values.extend(vertices[index])
+            handle.write(struct.pack("<12fH", *values, 0))
+
+
+def check_plate_selection(orca: str, datadir: Path, machine: Path, process: Path,
+                          filament: Path, workdir: Path, env: dict, bed: tuple[float, ...]) -> None:
+    """Generate a native project and verify selectors against real geometry, not filenames."""
+    from gcode import parse_gcode_stats
+    from threemf import inspect_layout
+
+    private = workdir / "multi-plate"
+    shutil.rmtree(private, ignore_errors=True)
+    private.mkdir(parents=True)
+    common = [orca, "--datadir", str(datadir), "--load-settings", f"{machine};{process}",
+              "--load-filaments", str(filament)]
+    boxes = [private / "short.stl", private / "tall.stl"]
+    for path, height in zip(boxes, (2.0, 4.0)):
+        _write_box(path, bed[0] * 0.68, bed[1] * 0.68, height)
+    project = private / "two-plates.3mf"
+
+    def run(cmd: list[str]) -> subprocess.CompletedProcess:
+        try:
+            return subprocess.run(cmd, cwd=private, env=env, capture_output=True, text=True,
+                                  timeout=180)
+        except subprocess.TimeoutExpired as exc:
+            fail(f"smoke: multi-plate timeout after {exc.timeout}s")
+
+    proc = run(common + ["--arrange", "1", "--export-3mf", str(project),
+                         *(str(p) for p in boxes)])
+    if proc.returncode != 0 or not project.is_file():
+        fail("smoke: could not generate the two-plate project", proc)
+    try:
+        layout = inspect_layout(project, max_uncompressed=64 * 1024 * 1024)
+    except Exception as exc:
+        fail(f"smoke: generated project failed layout discovery: {exc}", proc)
+    if layout.kind != "project" or [plate.index for plate in layout.plates] != [1, 2]:
+        fail(f"smoke: expected two discoverable plates, got {layout}", proc)
+
+    for selector, expected_layers in ((1, 10), (2, 20)):
+        out = private / f"out-{selector}"
+        out.mkdir()
+        proc = run(common + ["--slice", str(selector), "--outputdir", str(out), str(project)])
+        gcodes = list(out.glob("*.gcode"))
+        try:
+            result = json.loads((out / "result.json").read_text())
+        except (OSError, ValueError) as exc:
+            fail(f"smoke: plate {selector} has no valid result.json: {exc}", proc)
+        if (proc.returncode != 0 or result.get("return_code") != 0 or len(gcodes) != 1
+                or result.get("plate_index") != selector
+                or [p.get("id") for p in result.get("sliced_plates", [])] != [selector]):
+            fail(f"smoke: plate {selector} produced ambiguous or failed output: {result}", proc)
+        stats = parse_gcode_stats(gcodes[0])
+        if stats.get("layers") != expected_layers or not (stats.get("grams") or 0) > 0:
+            fail(f"smoke: plate {selector} has wrong geometry statistics: {stats}", proc)
+        print(f"smoke: ok selector={selector} layers={stats['layers']} {gcodes[0].name}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--orca", help="orca-slicer binary (slice step only)")
@@ -109,13 +181,20 @@ def main() -> None:
     if not args.orca or not args.datadir:
         ap.error("--orca and --datadir are required unless --fins-only is given")
     bed = tuple(float(part) for part in args.bed.lower().split("x"))
+    orca_path = shutil.which(args.orca)
+    if not orca_path:
+        fail(f"smoke: OrcaSlicer not found: {args.orca}")
+    orca_path = str(Path(orca_path).resolve())
 
-    workdir = Path(args.workdir)
+    workdir = Path(args.workdir).resolve()
     datadir = workdir / "datadir"
     outdir = workdir / "out"
     homedir = workdir / "home"
-    for d in (datadir, outdir, homedir):
+    tmpdir = workdir / "tmp"
+    runtime = workdir / "runtime"
+    for d in (datadir, outdir, homedir, tmpdir, runtime):
         d.mkdir(parents=True, exist_ok=True)
+    runtime.chmod(0o700)
     # fresh datadir copy
     if datadir.exists():
         shutil.rmtree(datadir)
@@ -123,6 +202,8 @@ def main() -> None:
 
     env = dict(os.environ)
     env["HOME"] = str(homedir)
+    env["TMPDIR"] = str(tmpdir)
+    env["XDG_RUNTIME_DIR"] = str(runtime)
     env["QT_QPA_PLATFORM"] = "offscreen"
     env["DISPLAY"] = ""
     env["LC_ALL"] = "C"
@@ -170,17 +251,17 @@ def main() -> None:
     profiles.write_json_atomic(eff_filament, filament)
 
     cmd = [
-        args.orca,
+        orca_path,
         "--datadir", str(datadir),
         "--load-settings", f"{eff_machine};{eff_process}",
         "--load-filaments", str(eff_filament),
         "--slice", "0",
         "--outputdir", str(outdir),
-        args.stl,
+        str(Path(args.stl).resolve()),
     ]
 
     try:
-        proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=180)
+        proc = subprocess.run(cmd, cwd=workdir, env=env, capture_output=True, text=True, timeout=180)
     except subprocess.TimeoutExpired as e:
         print(f"smoke: timeout after {e.timeout}s", file=sys.stderr)
         raise SystemExit(1)
@@ -217,6 +298,8 @@ def main() -> None:
         fail(f"smoke: time empty: {stats}", proc)
 
     print(f"smoke: ok {gcode.name} {json.dumps(stats)}")
+    check_plate_selection(orca_path, datadir, eff_machine, eff_process, eff_filament,
+                          workdir, env, bed)
 
 
 if __name__ == "__main__":

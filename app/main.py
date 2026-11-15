@@ -826,6 +826,15 @@ def run_slice(jid: str) -> None:
 
 
 def _run_slice_effective(jid, job, d, src, out, paths, options):
+    plate = job.get("plate")
+    selector = 0
+    if "plate" in job:
+        if (not isinstance(plate, dict) or type(plate.get("index")) is not int
+                or type(plate.get("count")) is not int
+                or not 1 <= plate["index"] <= plate["count"] <= archives.ZIP_MAX_MEMBERS):
+            write_job(jid, status="failed", error="invalid plate selector; re-upload the project")
+            return
+        selector = plate["index"]
     # The per-job effective presets are immutable here; fit uses the exact machine
     # passed to Orca, including any inherited area and the configured bed clamp.
     shrink = bool(options.get("shrink_to_fit"))
@@ -891,7 +900,7 @@ def _run_slice_effective(jid, job, d, src, out, paths, options):
         "--datadir", str(CONFIG.orca_datadir),
         "--load-settings", f"{paths['machine']};{process}",
         "--load-filaments", str(paths["filament"]),
-        "--slice", "0",
+        "--slice", str(selector),
     ]
     if orient and not job.get("support_fins"):
         cmd += ["--orient", "1"]
@@ -913,10 +922,17 @@ def _run_slice_effective(jid, job, d, src, out, paths, options):
     try:
         result_file = out / "result.json"
         result = json.loads(result_file.read_text()) if result_file.exists() else {}
+        if not isinstance(result, dict):
+            raise ValueError("invalid slicer result.json")
         gcodes = sorted(out.glob("*.gcode"))
-        if not gcodes:
+        if proc.returncode != 0 or result.get("return_code", 0) != 0:
+            detail = result.get("error_string") or (proc.stderr or proc.stdout or "")[-600:]
             write_job(jid, status="failed", elapsed=elapsed,
-                      error=result.get("error_string") or (proc.stderr or proc.stdout or "")[-600:])
+                      error=f"slicer failed (exit {proc.returncode}, result {result.get('return_code', 0)}): {detail}")
+            return
+        if len(gcodes) != 1:
+            write_job(jid, status="failed", elapsed=elapsed,
+                      error=f"slicer produced {len(gcodes)} G-code files; expected exactly one")
             return
         gcode = gcodes[0]
         stats = parse_gcode_stats(gcode)
@@ -1404,12 +1420,17 @@ async def _read_upload(file: UploadFile, dest: Path) -> int:
     return size
 
 
-def _upload_body(jid: str, archive: dict | None, record: dict | None) -> dict:
+def _upload_body(jid: str, archive: dict | None, record: dict | None,
+                 plate: dict | None = None, group: dict | None = None) -> dict:
     body = {"id": jid, "status": "awaiting_confirm"}
     if archive is not None:
         body["archive"] = archive
     if record is not None:
         body["threemf"] = record
+    if plate is not None:
+        body["plate"] = plate
+    if group is not None:
+        body["jobGroup"] = group
     return body
 
 
@@ -1446,12 +1467,7 @@ async def _upload_model(file: UploadFile, upload_name: str, output_name: str | N
 
 
 async def _upload_zip(file: UploadFile, upload_name: str, output_name: str | None) -> dict:
-    """Stage every printable member, then publish the batch or leave nothing behind.
-
-    The scratch tree is a hidden ``JOBS/.upload-*`` directory with no root ``job.json``,
-    so a listing or prune cannot treat it as a job. Preparation finishes, and its thread
-    is joined, before ``STAGE_LOCK`` is taken.
-    """
+    """Expand an archive or native 3MF completely, then prepare and publish atomically."""
     scratch = Path(tempfile.mkdtemp(prefix=".upload-", dir=JOBS))
     try:
         incoming = scratch / "incoming"
@@ -1460,43 +1476,76 @@ async def _upload_zip(file: UploadFile, upload_name: str, output_name: str | Non
         size = await _read_upload(file, archive_path)
         extract_root = scratch / "extract"
         extract_root.mkdir()
+        expanded: list[tuple[Path, dict | None, dict | None]] = []
+        container = True
         try:
-            selections = archives.extract_models(
-                archive_path, extract_root, allowed=ALLOWED,
-                max_uncompressed=CONFIG.max_upload_bytes)
+            if archive_path.suffix.lower() == ".3mf":
+                layout = threemf.inspect_layout(archive_path, max_uncompressed=CONFIG.max_upload_bytes)
+                if layout.kind == "project":
+                    container = False
+                    sources = [(archive_path, None, layout)]
+                else:
+                    sources = []
+            else:
+                sources = []
+            if container:
+                selections = archives.extract_models(
+                    archive_path, extract_root, allowed=ALLOWED,
+                    max_uncompressed=CONFIG.max_upload_bytes)
+                for selection in selections:
+                    provenance = {"name": upload_name, "member": selection.member,
+                                  "candidates": list(selection.candidates),
+                                  "skipped": list(selection.skipped), "members": selection.members}
+                    layout = None
+                    if selection.written.suffix.lower() == ".3mf":
+                        layout = threemf.inspect_layout(selection.written, max_uncompressed=CONFIG.max_upload_bytes)
+                        if layout.kind != "project":
+                            raise archives.ArchiveError(400, "nested loose-model 3MF packaging is unsupported")
+                    sources.append((selection.written, provenance, layout))
+            for model, provenance, layout in sources:
+                if layout is None:
+                    expanded.append((model, provenance, None))
+                else:
+                    count = len(layout.plates)
+                    for plate in layout.plates:
+                        descriptor = ({"index": plate.index, "name": plate.name, "count": count}
+                                      if plate.index else None)
+                        expanded.append((model, provenance, descriptor))
+                if len(expanded) > archives.ZIP_MAX_MEMBERS:
+                    raise archives.ArchiveError(413, f"upload expands to more than {archives.ZIP_MAX_MEMBERS} jobs")
         except archives.ArchiveError as exc:
             raise HTTPException(exc.status, str(exc)) from exc
 
         reserved: set[str] = set()
         staged: list[dict] = []
-        for index, selection in enumerate(selections):
+        for index, (source, provenance, plate) in enumerate(expanded):
             jid = _allocate_job_id(reserved)
             stage = scratch / "stage" / jid
             upload_dir = stage / "upload"
             upload_dir.mkdir(parents=True)
-            model_path = upload_dir / selection.written.name
-            shutil.copyfile(selection.written, model_path)
+            model_path = upload_dir / source.name
+            shutil.copyfile(source, model_path)
             os.chmod(model_path, 0o644)
-            if index == 0:
-                # provenance lives on the first job only; siblings keep their own model copy
-                zip_copy = upload_dir / upload_name
-                shutil.copyfile(archive_path, zip_copy)
-                os.chmod(zip_copy, 0o644)
-            if len(selections) == 1:
-                if not (output_name or "").strip():
-                    name = normalise_output_name(None, model_path.stem)
-                else:
-                    name = normalise_output_name(output_name, model_path.stem)
-            else:
-                name = _batch_output_name(output_name, model_path.stem, index + 1)
-            archive = {"name": upload_name, "member": selection.member,
-                       "candidates": list(selection.candidates),
-                       "skipped": list(selection.skipped), "members": selection.members}
+            name = (normalise_output_name(output_name, model_path.stem) if len(expanded) == 1
+                    else _batch_output_name(output_name, model_path.stem, index + 1))
             staged.append({"jid": jid, "stage": stage, "model_path": model_path,
-                           "name": name, "archive": archive})
+                           "name": name, "archive": provenance, "plate": plate})
 
+        group = ({"id": uuid.uuid4().hex[:12], "name": upload_name,
+                  "job_ids": [item["jid"] for item in staged]} if len(staged) > 1 else None)
         prepared = await _await_prepare(
             _prepare_models, [(item["model_path"], item["stage"]) for item in staged])
+        # Keep the outer container only with the first job, without overwriting either the
+        # canonical model or its identity-rewritten input (names can coincide in 3MF wrappers).
+        if container:
+            upload_dir = staged[0]["model_path"].parent
+            archive_copy = upload_dir / upload_name
+            if archive_copy.exists():
+                archive_dir = staged[0]["stage"] / "archive"
+                archive_dir.mkdir()
+                archive_copy = archive_dir / upload_name
+            shutil.copyfile(archive_path, archive_copy)
+            os.chmod(archive_copy, 0o644)
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
         entries: list[tuple[str, Path, dict]] = []
         bodies: list[dict] = []
@@ -1507,13 +1556,19 @@ async def _upload_zip(file: UploadFile, upload_name: str, output_name: str | Non
                     "filename": model_path.name, "output_name": item["name"],
                     "upload_bytes": size, "model_bytes": model_path.stat().st_size,
                     "profile_snapshot": snapshot, "pinned_presets": pins,
-                    "created": now, "updated": now, "archive": item["archive"]}
+                    "created": now, "updated": now}
+            if item["archive"] is not None:
+                meta["archive"] = item["archive"]
+            if item["plate"] is not None:
+                meta["plate"] = item["plate"]
+            if group is not None:
+                meta["jobGroup"] = group
             if record is not None:
                 meta["threemf"] = record
             if slicer_input is not None:
                 meta["slicer_input"] = slicer_input
             entries.append((item["jid"], item["stage"], meta))
-            bodies.append(_upload_body(item["jid"], item["archive"], record))
+            bodies.append(_upload_body(item["jid"], item["archive"], record, item["plate"], group))
         _publish_upload_batch(entries)
     except prof.ProfileError as exc:
         raise HTTPException(409, f"profile: {exc}") from exc
@@ -1538,7 +1593,7 @@ async def api_upload(request: Request, file: UploadFile = File(...),
     if (output_name or "").strip():
         normalise_output_name(output_name, Path(upload_name).stem)
     # support_fins is accepted and ignored: fins run at confirmation, not at upload
-    if suffix == ".zip":
+    if suffix in {".zip", ".3mf"}:
         return await _upload_zip(file, upload_name, output_name)
     return await _upload_model(file, upload_name, output_name)
 
@@ -1563,6 +1618,22 @@ def _canonical_model(jid: str, job: dict) -> Path:
     return model
 
 
+MULTIPLATE_GEOMETRY_REASON = (
+    "geometry editing and preview are unavailable for multi-plate projects; "
+    "export this plate separately to resize or add support fins"
+)
+
+
+def _multi_plate(job: dict) -> bool:
+    plate = job.get("plate")
+    return isinstance(plate, dict) and type(plate.get("count")) is int and plate["count"] > 1
+
+
+def _guard_plate_geometry(job: dict) -> None:
+    if _multi_plate(job):
+        raise HTTPException(409, MULTIPLATE_GEOMETRY_REASON)
+
+
 def _job_capabilities(job: dict) -> dict:
     result = dict(job)
     eligible = job.get("status") in ("sliced", "failed")
@@ -1577,7 +1648,10 @@ def _job_capabilities(job: dict) -> dict:
         editable = job.get("status") == "awaiting_confirm"
         geometry = {"preview_available": False, "resize_available": False,
                     "reason": "geometry unavailable"}
-        if editable:
+        if _multi_plate(job):
+            geometry = {"preview_available": False, "resize_available": False,
+                        "reason": MULTIPLATE_GEOMETRY_REASON}
+        elif editable:
             try:
                 geometry = preview.geometry_capability(_canonical_model(job["id"], job))
             except (HTTPException, OSError):
@@ -1636,7 +1710,7 @@ def api_reslice(jid: str, body: dict):
                      "model_bytes": model.stat().st_size, "profile_snapshot": local_snapshot,
                      "manual_scale": 1.0,
                      "profile_warning": "Preset references use current contents, not historical preset bytes."}
-            for key in ("support_fins", "fins"):
+            for key in ("support_fins", "fins", "plate"):
                 if key in source:
                     child[key] = source[key]
             (staging / "job.json").write_text(json.dumps(child, indent=2))
@@ -1669,6 +1743,8 @@ def api_reslice_settings(jid: str, body: dict):
             raise HTTPException(409, "job is not a staged reslice")
         if body["revision"] != job.get("revision"):
             raise HTTPException(409, "stale revision")
+        if body.get("pending_support_fins"):
+            _guard_plate_geometry(job)
         snapshot = dict(job.get("profile_snapshot") or {})
         merged = {key: snapshot.get(key) for key in ("machine", "process", "filament")}
         for key, value in profile.items():
@@ -1732,6 +1808,7 @@ def uniform_max_factor(size: list[float], maxima: dict[str, float]) -> float:
 
 
 def _apply_support_fins(jid: str, job: dict) -> dict:
+    _guard_plate_geometry(job)
     model_path = _canonical_model(jid, job)
     finned = model_path.parent / f"fins-{model_path.stem}.3mf"
     try:
@@ -1828,6 +1905,8 @@ def api_confirm_slice(jid: str, body: dict | None = None):
             job = read_job(jid)
             if job.get("status") != "awaiting_confirm":
                 raise HTTPException(409, f"job is '{job.get('status')}', not awaiting confirmation")
+            if body.get("support_fins") or "resize" in body:
+                _guard_plate_geometry(job)
 
         # 1. Re-pin options
         pinned_presets = dict(job.get("pinned_presets") or {})
@@ -2039,6 +2118,7 @@ def api_preview(jid: str, mode: str | None = None):
         if job.get("kind") == "reslice":
             if job.get("status") != "awaiting_confirm":
                 raise HTTPException(409, "job is not awaiting confirmation")
+            _guard_plate_geometry(job)
             path = _canonical_model(jid, job)
             try:
                 scene = preview.read_scene(path)
@@ -2062,6 +2142,7 @@ def api_preview_shot(jid: str, view: str = "front_left"):
 def api_scale(jid: str, payload: dict):
     with STAGE_LOCK:
         job = read_job(jid)
+        _guard_plate_geometry(job)
         if job.get("kind") == "reslice":
             return _scale_reslice(jid, job, payload)
         return _scale_fins(jid, job, payload)
@@ -2239,11 +2320,18 @@ def api_scale_reset(jid: str, payload: dict):
             with tempfile.NamedTemporaryFile(dir=path.parent, suffix=path.suffix, delete=False) as f:
                 candidate = Path(f.name)
             shutil.copyfile(baseline, candidate)
-            # Reset must also work for unsupported preview geometry.
-            geometry = preview.geometry_capability(candidate)
+            # Reset restores the untouched baseline; never inspect the whole multi-plate scene.
+            if _multi_plate(job):
+                geometry = {"size": None, "preview_available": False, "resize_available": False,
+                            "reason": MULTIPLATE_GEOMETRY_REASON}
+            else:
+                geometry = preview.geometry_capability(candidate)
             updated = _commit_reslice_geometry(jid, job, path, candidate, 1.0)
-            return {"job": jid, "revision": updated["revision"], "manual_scale": 1.0,
-                    "size": geometry["size"], "unit": "millimeter"}
+            result = {"job": jid, "revision": updated["revision"], "manual_scale": 1.0,
+                      "size": geometry["size"], "unit": "millimeter"}
+            if _multi_plate(job):
+                result.update({k: geometry[k] for k in ("preview_available", "resize_available", "reason")})
+            return result
         except OSError as exc:
             raise HTTPException(409, f"reset unavailable: {exc}") from exc
         finally:

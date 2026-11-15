@@ -9,9 +9,11 @@ import io
 import json
 import zipfile
 import zlib
+from pathlib import Path
 
 import pytest
 
+import archives
 import profiles as prof
 import threemf
 
@@ -464,3 +466,677 @@ def test_strict_rewrite_bounds_expanded_archive_and_compressed_input(zip_bytes, 
     monkeypatch.setattr(threemf, 'IDENTITY_SOURCE_MAX_BYTES', 1)
     with pytest.raises(threemf.IdentityPreflightError, match='compressed'):
         threemf.rewrite_identity_strict(blob, machine, process)
+
+
+# --------------------------------------------------------------------------- layout discovery
+
+def _make_3mf(entries: dict[str, bytes | str]) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, data in entries.items():
+            raw = data.encode("utf-8") if isinstance(data, str) else data
+            zf.writestr(name, raw)
+    return buf.getvalue()
+
+
+def _write_3mf(tmp_path: Path, entries: dict[str, bytes | str], filename: str = "test.3mf") -> Path:
+    p = tmp_path / filename
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(_make_3mf(entries))
+    return p
+
+
+MODEL_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<model unit="millimeter" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">
+  <resources>
+    <object id="1" type="model">
+      <mesh><vertices/><triangles/></mesh>
+    </object>
+  </resources>
+  <build>
+    <item objectid="1"/>
+  </build>
+</model>"""
+
+
+def test_generic_build_with_multiple_objects_remains_one_bed(tmp_path):
+    multi_obj_model = """<?xml version="1.0" encoding="UTF-8"?>
+    <model unit="millimeter" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">
+      <resources>
+        <object id="1" type="model"><mesh><vertices/><triangles/></mesh></object>
+        <object id="2" type="model"><mesh><vertices/><triangles/></mesh></object>
+        <object id="3" type="model"><mesh><vertices/><triangles/></mesh></object>
+      </resources>
+      <build>
+        <item objectid="1"/>
+        <item objectid="2"/>
+        <item objectid="3"/>
+      </build>
+    </model>"""
+    path = _write_3mf(tmp_path, {
+        "3D/3dmodel.model": multi_obj_model,
+        "Metadata/model_settings.config": "<?xml version='1.0'?><config></config>",
+    })
+    layout = threemf.inspect_layout(path, max_uncompressed=1024 * 1024)
+    assert layout == threemf.ThreeMfLayout(kind="project", plates=(threemf.ThreeMfPlate(0),))
+
+
+def test_two_named_model_settings_plates(tmp_path):
+    config = """<?xml version="1.0" encoding="UTF-8"?>
+    <config>
+      <plate>
+        <metadata key="plater_id" value="1"/>
+        <metadata key="plater_name" value="Base Plate"/>
+      </plate>
+      <plate>
+        <metadata key="plater_id" value="2"/>
+        <metadata key="plater_name" value="Lid Plate"/>
+      </plate>
+    </config>"""
+    path = _write_3mf(tmp_path, {
+        "3D/3dmodel.model": MODEL_XML,
+        "Metadata/model_settings.config": config,
+    })
+    layout = threemf.inspect_layout(path, max_uncompressed=1024 * 1024)
+    assert layout == threemf.ThreeMfLayout(
+        kind="project",
+        plates=(
+            threemf.ThreeMfPlate(1, "Base Plate"),
+            threemf.ThreeMfPlate(2, "Lid Plate"),
+        ),
+    )
+
+
+def test_slice_info_fallback(tmp_path):
+    slice_info = """<?xml version="1.0" encoding="UTF-8"?>
+    <config>
+      <plate>
+        <metadata key="index" value="1"/>
+        <metadata key="name" value="Plate Alpha"/>
+      </plate>
+      <plate>
+        <metadata key="index" value="2"/>
+        <metadata key="name" value="Plate Beta"/>
+      </plate>
+    </config>"""
+    path = _write_3mf(tmp_path, {
+        "3D/3dmodel.model": MODEL_XML,
+        "Metadata/slice_info.config": slice_info,
+    })
+    layout = threemf.inspect_layout(path, max_uncompressed=1024 * 1024)
+    assert layout == threemf.ThreeMfLayout(
+        kind="project",
+        plates=(
+            threemf.ThreeMfPlate(1, "Plate Alpha"),
+            threemf.ThreeMfPlate(2, "Plate Beta"),
+        ),
+    )
+
+
+def test_authoritative_model_settings_precedence(tmp_path):
+    ms_config = """<?xml version="1.0" encoding="UTF-8"?>
+    <config>
+      <plate>
+        <metadata key="plater_id" value="1"/>
+        <metadata key="plater_name" value="Authoritative One"/>
+      </plate>
+      <plate>
+        <metadata key="plater_id" value="2"/>
+        <metadata key="plater_name" value="Authoritative Two"/>
+      </plate>
+    </config>"""
+    si_config = """<?xml version="1.0" encoding="UTF-8"?>
+    <config>
+      <plate>
+        <metadata key="index" value="1"/>
+        <metadata key="name" value="Ignored Fallback"/>
+      </plate>
+    </config>"""
+    path = _write_3mf(tmp_path, {
+        "3D/3dmodel.model": MODEL_XML,
+        "Metadata/model_settings.config": ms_config,
+        "Metadata/slice_info.config": si_config,
+    })
+    layout = threemf.inspect_layout(path, max_uncompressed=1024 * 1024)
+    assert layout == threemf.ThreeMfLayout(
+        kind="project",
+        plates=(
+            threemf.ThreeMfPlate(1, "Authoritative One"),
+            threemf.ThreeMfPlate(2, "Authoritative Two"),
+        ),
+    )
+
+
+def test_namespace_and_attribute_quoting_variations(tmp_path):
+    # Namespaced tags, single quotes, reversed attribute order, and direct plate attributes
+    config = """<?xml version='1.0' encoding='UTF-8'?>
+    <bbl:config xmlns:bbl="http://schemas.bambulab.com/package/2021">
+      <bbl:plate plater_name='Plate One' plater_id='1'/>
+      <bbl:plate>
+        <bbl:metadata value='2' key='plater_id'/>
+        <bbl:metadata value='Plate Two' key='plater_name'/>
+      </bbl:plate>
+    </bbl:config>"""
+    path = _write_3mf(tmp_path, {
+        "3D/3dmodel.model": MODEL_XML,
+        "Metadata/model_settings.config": config,
+    })
+    layout = threemf.inspect_layout(path, max_uncompressed=1024 * 1024)
+    assert layout == threemf.ThreeMfLayout(
+        kind="project",
+        plates=(
+            threemf.ThreeMfPlate(1, "Plate One"),
+            threemf.ThreeMfPlate(2, "Plate Two"),
+        ),
+    )
+
+
+def test_object_metadata_not_mistaken_for_plate_data(tmp_path):
+    config_objects_only = """<?xml version="1.0" encoding="UTF-8"?>
+    <config>
+      <object id="1">
+        <metadata key="plater_id" value="1"/>
+        <metadata key="plate_id" value="1"/>
+      </object>
+      <object id="2">
+        <metadata key="plater_id" value="2"/>
+        <metadata key="plate_id" value="2"/>
+      </object>
+    </config>"""
+    path = _write_3mf(tmp_path, {
+        "3D/3dmodel.model": MODEL_XML,
+        "Metadata/model_settings.config": config_objects_only,
+    })
+    layout = threemf.inspect_layout(path, max_uncompressed=1024 * 1024)
+    assert layout == threemf.ThreeMfLayout(kind="project", plates=(threemf.ThreeMfPlate(0),))
+
+    config_one_plate_many_objects = """<?xml version="1.0" encoding="UTF-8"?>
+    <config>
+      <plate>
+        <metadata key="plater_id" value="1"/>
+        <metadata key="plater_name" value="Single Bed"/>
+      </plate>
+      <object id="2"><metadata key="plater_id" value="2"/></object>
+      <object id="3"><metadata key="plater_id" value="3"/></object>
+    </config>"""
+    path2 = _write_3mf(tmp_path, {
+        "3D/3dmodel.model": MODEL_XML,
+        "Metadata/model_settings.config": config_one_plate_many_objects,
+    }, "one_plate.3mf")
+    layout2 = threemf.inspect_layout(path2, max_uncompressed=1024 * 1024)
+    assert layout2 == threemf.ThreeMfLayout(kind="project", plates=(threemf.ThreeMfPlate(1, "Single Bed"),))
+
+
+def test_missing_and_empty_plate_metadata_rejected(tmp_path):
+    for bad_cfg in (
+        "<config><plate/></config>",
+        "<config><plate><metadata key='plater_id' value=''/></plate></config>",
+        "<config><plate><metadata key='other' value='val'/></plate></config>",
+    ):
+        path = _write_3mf(tmp_path, {"3D/3dmodel.model": MODEL_XML, "Metadata/model_settings.config": bad_cfg})
+        with pytest.raises(archives.ArchiveError) as err:
+            threemf.inspect_layout(path, max_uncompressed=1024 * 1024)
+        assert err.value.status == 400
+
+
+def test_invalid_duplicate_and_unmappable_indices_rejected(tmp_path):
+    cases = [
+        ("<config><plate><metadata key='plater_id' value='0'/></plate></config>", 400),
+        ("<config><plate><metadata key='plater_id' value='-1'/></plate></config>", 400),
+        ("<config><plate><metadata key='plater_id' value='abc'/></plate></config>", 400),
+        ("<config><plate><metadata key='plater_id' value='1'/></plate><plate><metadata key='plater_id' value='1'/></plate></config>", 400),
+        ("<config><plate><metadata key='plater_id' value='1'/></plate><plate><metadata key='plater_id' value='3'/></plate></config>", 400),
+        ("<config><plate><metadata key='plater_id' value='2'/></plate></config>", 400),
+    ]
+    for xml, status in cases:
+        path = _write_3mf(tmp_path, {"3D/3dmodel.model": MODEL_XML, "Metadata/model_settings.config": xml})
+        with pytest.raises(archives.ArchiveError) as err:
+            threemf.inspect_layout(path, max_uncompressed=1024 * 1024)
+        assert err.value.status == status
+
+
+def test_corrupt_zip_and_crc_rejected(tmp_path):
+    bad_zip = tmp_path / "bad.3mf"
+    bad_zip.write_bytes(b"not a zip file")
+    with pytest.raises(archives.ArchiveError) as err:
+        threemf.inspect_layout(bad_zip, max_uncompressed=1024 * 1024)
+    assert err.value.status == 400
+
+    full = _make_3mf({"3D/3dmodel.model": MODEL_XML})
+    trunc = tmp_path / "trunc.3mf"
+    trunc.write_bytes(full[:len(full) // 2])
+    with pytest.raises(archives.ArchiveError) as err:
+        threemf.inspect_layout(trunc, max_uncompressed=1024 * 1024)
+    assert err.value.status == 400
+
+    data = bytearray(full)
+    cd_offset = data.find(b"PK\x01\x02")
+    data[cd_offset + 16] ^= 0xFF
+    crc_corrupt = tmp_path / "crc.3mf"
+    crc_corrupt.write_bytes(bytes(data))
+    with pytest.raises(archives.ArchiveError) as err:
+        threemf.inspect_layout(crc_corrupt, max_uncompressed=1024 * 1024)
+    assert err.value.status == 400
+
+
+def test_case_and_separator_normalization_and_duplicate_canonical_parts(tmp_path):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("3D/3dmodel.model", MODEL_XML)
+        zf.writestr("3d/3dmodel.model", MODEL_XML)
+    p = tmp_path / "dup_model.3mf"
+    p.write_bytes(buf.getvalue())
+    with pytest.raises(archives.ArchiveError) as err:
+        threemf.inspect_layout(p, max_uncompressed=1024 * 1024)
+    assert err.value.status == 400
+    assert "duplicate archive member" in str(err.value)
+
+    buf2 = io.BytesIO()
+    with zipfile.ZipFile(buf2, "w") as zf:
+        zf.writestr("3D/3dmodel.model", MODEL_XML)
+        zf.writestr("Metadata/model_settings.config", "<config/>")
+        zf.writestr(r"Metadata\model_settings.config", "<config/>")
+    p2 = tmp_path / "dup_meta.3mf"
+    p2.write_bytes(buf2.getvalue())
+    with pytest.raises(archives.ArchiveError) as err:
+        threemf.inspect_layout(p2, max_uncompressed=1024 * 1024)
+    assert err.value.status == 400
+    assert "duplicate archive member" in str(err.value)
+
+
+def test_nonstandard_native_referenced_model_parts(tmp_path):
+    rels_xml = """<?xml version="1.0" encoding="UTF-8"?>
+    <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+      <Relationship Id="rel-1" Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel" Target="/Custom/scene.model"/>
+    </Relationships>"""
+    path = _write_3mf(tmp_path, {
+        "_rels/.rels": rels_xml,
+        "Custom/scene.model": MODEL_XML,
+        "Metadata/model_settings.config": """<config><plate><metadata key="plater_id" value="1"/><metadata key="plater_name" value="Custom"/></plate></config>""",
+    })
+    layout = threemf.inspect_layout(path, max_uncompressed=1024 * 1024)
+    assert layout == threemf.ThreeMfLayout(kind="project", plates=(threemf.ThreeMfPlate(1, "Custom"),))
+
+    bad_rels = """<?xml version="1.0" encoding="UTF-8"?>
+    <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+      <Relationship Id="rel-1" Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel" Target="/Custom/missing.model"/>
+    </Relationships>"""
+    bad_path = _write_3mf(tmp_path, {"_rels/.rels": bad_rels}, "missing_target.3mf")
+    with pytest.raises(archives.ArchiveError) as err:
+        threemf.inspect_layout(bad_path, max_uncompressed=1024 * 1024)
+    assert err.value.status == 400
+    assert "referenced in relationships is missing" in str(err.value)
+
+    ambig_rels = """<?xml version="1.0" encoding="UTF-8"?>
+    <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+      <Relationship Id="rel-1" Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel" Target="/Custom/one.model"/>
+      <Relationship Id="rel-2" Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel" Target="/Custom/two.model"/>
+    </Relationships>"""
+    ambig_path = _write_3mf(tmp_path, {
+        "_rels/.rels": ambig_rels,
+        "Custom/one.model": MODEL_XML,
+        "Custom/two.model": MODEL_XML,
+    }, "ambig.3mf")
+    with pytest.raises(archives.ArchiveError) as err:
+        threemf.inspect_layout(ambig_path, max_uncompressed=1024 * 1024)
+    assert err.value.status == 400
+    assert "ambiguous or duplicate 3MF model parts in relationships" in str(err.value)
+
+
+def test_stl_attachment_does_not_supersede_project_geometry(tmp_path):
+    path = _write_3mf(tmp_path, {
+        "3D/3dmodel.model": MODEL_XML,
+        "attachments/part.stl": b"solid binary stl data",
+        "Metadata/model_settings.config": """<config><plate><metadata key="plater_id" value="1"/></plate></config>""",
+    })
+    layout = threemf.inspect_layout(path, max_uncompressed=1024 * 1024)
+    assert layout.kind == "project"
+    assert layout.plates == (threemf.ThreeMfPlate(1),)
+
+
+def test_loose_model_wrapper_detection(tmp_path):
+    path = _write_3mf(tmp_path, {
+        "model1.stl": b"solid one\n",
+        "model2.obj": b"v 0 0 0\n",
+        "readme.txt": b"info",
+    }, "loose_wrapper.3mf")
+    layout = threemf.inspect_layout(path, max_uncompressed=1024 * 1024)
+    assert layout == threemf.ThreeMfLayout(kind="models", plates=())
+
+
+def test_expansion_and_member_limits(tmp_path):
+    huge_member = _write_3mf(tmp_path, {"3D/3dmodel.model": "x" * 200}, "huge_member.3mf")
+    with pytest.raises(archives.ArchiveError) as err:
+        threemf.inspect_layout(huge_member, max_uncompressed=100)
+    assert err.value.status == 413
+
+    multi_member = _write_3mf(tmp_path, {
+        "3D/3dmodel.model": "x" * 60,
+        "other.txt": "y" * 60,
+    }, "multi_member.3mf")
+    with pytest.raises(archives.ArchiveError) as err:
+        threemf.inspect_layout(multi_member, max_uncompressed=100)
+    assert err.value.status == 413
+
+    oversized_config = _write_3mf(tmp_path, {
+        "3D/3dmodel.model": MODEL_XML,
+        "Metadata/model_settings.config": "<!--" + "x" * (threemf.MEMBER_MAX_BYTES + 10) + "-->" + "<config/>",
+    }, "oversized_config.3mf")
+    with pytest.raises(archives.ArchiveError) as err:
+        threemf.inspect_layout(oversized_config, max_uncompressed=32 * 1024 * 1024)
+    assert err.value.status == 413
+
+    plates_xml = "<config>" + "".join(
+        f'<plate><metadata key="plater_id" value="{i}"/></plate>'
+        for i in range(1, archives.ZIP_MAX_MEMBERS + 2)
+    ) + "</config>"
+    too_many_plates = _write_3mf(tmp_path, {
+        "3D/3dmodel.model": MODEL_XML,
+        "Metadata/model_settings.config": plates_xml,
+    }, "too_many_plates.3mf")
+    with pytest.raises(archives.ArchiveError) as err:
+        threemf.inspect_layout(too_many_plates, max_uncompressed=1024 * 1024)
+    assert err.value.status == 413
+
+
+def test_traversal_symlink_and_encryption_rejected(tmp_path):
+    traversal = _write_3mf(tmp_path, {
+        "3D/../../evil.model": MODEL_XML,
+    }, "traversal.3mf")
+    with pytest.raises(archives.ArchiveError) as err:
+        threemf.inspect_layout(traversal, max_uncompressed=1024 * 1024)
+    assert err.value.status == 400
+    assert "archive member is not safe" in str(err.value)
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("3D/3dmodel.model", MODEL_XML)
+        info = zipfile.ZipInfo("link.txt")
+        info.external_attr = 0o120777 << 16
+        zf.writestr(info, b"target")
+    symlink_path = tmp_path / "symlink.3mf"
+    symlink_path.write_bytes(buf.getvalue())
+    with pytest.raises(archives.ArchiveError) as err:
+        threemf.inspect_layout(symlink_path, max_uncompressed=1024 * 1024)
+    assert err.value.status == 400
+    assert "archive member is a symlink" in str(err.value)
+
+    buf2 = io.BytesIO()
+    with zipfile.ZipFile(buf2, "w") as zf:
+        zf.writestr("3D/3dmodel.model", MODEL_XML)
+    data = bytearray(buf2.getvalue())
+    cd = data.find(b"PK\x01\x02")
+    data[cd + 8] |= 0x1
+    enc_path = tmp_path / "enc.3mf"
+    enc_path.write_bytes(bytes(data))
+    with pytest.raises(archives.ArchiveError) as err:
+        threemf.inspect_layout(enc_path, max_uncompressed=1024 * 1024)
+    assert err.value.status == 400
+    assert str(err.value) == "not a readable .zip archive"
+
+
+def test_malformed_xml_and_entity_dtd_rejection(tmp_path):
+    doctype_model = """<?xml version="1.0"?>
+    <!DOCTYPE model SYSTEM "http://evil.com/evil.dtd">
+    <model unit="millimeter"/>"""
+    p1 = _write_3mf(tmp_path, {"3D/3dmodel.model": doctype_model}, "doctype_model.3mf")
+    with pytest.raises(archives.ArchiveError) as err:
+        threemf.inspect_layout(p1, max_uncompressed=1024 * 1024)
+    assert err.value.status == 400
+    assert "DOCTYPE" in str(err.value)
+
+    entity_model = """<?xml version="1.0"?>
+    <!DOCTYPE model [ <!ENTITY xxe "payload"> ]>
+    <model unit="millimeter">&xxe;</model>"""
+    p2 = _write_3mf(tmp_path, {"3D/3dmodel.model": entity_model}, "entity_model.3mf")
+    with pytest.raises(archives.ArchiveError) as err:
+        threemf.inspect_layout(p2, max_uncompressed=1024 * 1024)
+    assert err.value.status == 400
+
+    p3 = _write_3mf(tmp_path, {"3D/3dmodel.model": "<model><unclosed>"}, "malformed_model.3mf")
+    with pytest.raises(archives.ArchiveError) as err:
+        threemf.inspect_layout(p3, max_uncompressed=1024 * 1024)
+    assert err.value.status == 400
+    assert "malformed XML" in str(err.value)
+
+    doctype_config = """<?xml version="1.0"?>
+    <!DOCTYPE config SYSTEM "http://evil.com/evil.dtd">
+    <config><plate><metadata key="plater_id" value="1"/></plate></config>"""
+    p4 = _write_3mf(tmp_path, {
+        "3D/3dmodel.model": MODEL_XML,
+        "Metadata/model_settings.config": doctype_config,
+    }, "doctype_config.3mf")
+    with pytest.raises(archives.ArchiveError) as err:
+        threemf.inspect_layout(p4, max_uncompressed=1024 * 1024)
+    assert err.value.status == 400
+
+    p5 = _write_3mf(tmp_path, {
+        "3D/3dmodel.model": MODEL_XML,
+        "Metadata/model_settings.config": "<config><unclosed>",
+    }, "malformed_config.3mf")
+    with pytest.raises(archives.ArchiveError) as err:
+        threemf.inspect_layout(p5, max_uncompressed=1024 * 1024)
+    assert err.value.status == 400
+
+    p6 = _write_3mf(tmp_path, {
+        "3D/3dmodel.model": MODEL_XML,
+        "Metadata/slice_info.config": doctype_config,
+    }, "doctype_slice_info.3mf")
+    with pytest.raises(archives.ArchiveError) as err:
+        threemf.inspect_layout(p6, max_uncompressed=1024 * 1024)
+    assert err.value.status == 400
+
+    p7 = _write_3mf(tmp_path, {
+        "3D/3dmodel.model": MODEL_XML,
+        "Metadata/slice_info.config": "<config><unclosed>",
+    }, "malformed_slice_info.3mf")
+    with pytest.raises(archives.ArchiveError) as err:
+        threemf.inspect_layout(p7, max_uncompressed=1024 * 1024)
+    assert err.value.status == 400
+
+    p8 = _write_3mf(tmp_path, {
+        "_rels/.rels": "<!DOCTYPE rels><Relationships/>",
+        "3D/3dmodel.model": MODEL_XML,
+    }, "doctype_rels.3mf")
+    with pytest.raises(archives.ArchiveError) as err:
+        threemf.inspect_layout(p8, max_uncompressed=1024 * 1024)
+    assert err.value.status == 400
+
+    p9 = _write_3mf(tmp_path, {
+        "_rels/.rels": "<Relationships><unclosed>",
+        "3D/3dmodel.model": MODEL_XML,
+    }, "malformed_rels.3mf")
+    with pytest.raises(archives.ArchiveError) as err:
+        threemf.inspect_layout(p9, max_uncompressed=1024 * 1024)
+    assert err.value.status == 400
+
+
+# --------------------------------------------------------------------------- R1, R2, R3, R4 regression tests
+
+@pytest.mark.parametrize("config_member", [
+    "Metadata/slice_info.config",
+    "Metadata/model_settings.config",
+])
+@pytest.mark.parametrize("bad_plate_xml", [
+    "<config><plate/><plate/></config>",
+    "<config><plate name='one'/><plate name='two'/></config>",
+    "<config><plate plater_name='one'/><plate plater_name='two'/></config>",
+    "<config><plate><metadata key='name' value='one'/></plate></config>",
+    "<config><plate><metadata key='plater_name' value='one'/></plate></config>",
+    "<config><plate index='1'/><plate/></config>",
+    "<config><plate/><plate index='2'/></config>",
+    "<config><plate plater_id='1'/><plate name='two'/></config>",
+    "<config><plate index='1'/><plate plater_name='two'/></config>",
+])
+def test_reject_selectorless_explicit_plates(tmp_path, config_member, bad_plate_xml):
+    path = _write_3mf(tmp_path, {
+        "3D/3dmodel.model": MODEL_XML,
+        config_member: bad_plate_xml,
+    })
+    with pytest.raises(archives.ArchiveError) as err:
+        threemf.inspect_layout(path, max_uncompressed=1024 * 1024)
+    assert err.value.status == 400
+
+
+@pytest.mark.parametrize("config_member", [
+    "Metadata/slice_info.config",
+    "Metadata/model_settings.config",
+])
+@pytest.mark.parametrize("empty_decl_xml", [
+    "<config></config>",
+    "<config><header><header_item key='X-BBL-Client-Type' value='slicer'/></header></config>",
+    "<config><object id='1'><metadata key='other' value='val'/></object></config>",
+])
+def test_preserve_generic_plate_zero_when_no_plate_declarations(tmp_path, config_member, empty_decl_xml):
+    path = _write_3mf(tmp_path, {
+        "3D/3dmodel.model": MODEL_XML,
+        config_member: empty_decl_xml,
+    })
+    layout = threemf.inspect_layout(path, max_uncompressed=1024 * 1024)
+    assert layout == threemf.ThreeMfLayout(kind="project", plates=(threemf.ThreeMfPlate(0),))
+
+
+def test_authoritative_precedence_over_invalid_fallback_plates(tmp_path):
+    ms_config = """<?xml version="1.0" encoding="UTF-8"?>
+    <config>
+      <plate><metadata key="plater_id" value="1"/><metadata key="plater_name" value="Valid 1"/></plate>
+      <plate><metadata key="plater_id" value="2"/><metadata key="plater_name" value="Valid 2"/></plate>
+    </config>"""
+    si_bad = "<config><plate/><plate/></config>"
+    path = _write_3mf(tmp_path, {
+        "3D/3dmodel.model": MODEL_XML,
+        "Metadata/model_settings.config": ms_config,
+        "Metadata/slice_info.config": si_bad,
+    })
+    layout = threemf.inspect_layout(path, max_uncompressed=1024 * 1024)
+    assert layout == threemf.ThreeMfLayout(
+        kind="project",
+        plates=(threemf.ThreeMfPlate(1, "Valid 1"), threemf.ThreeMfPlate(2, "Valid 2")),
+    )
+
+
+@pytest.mark.parametrize("config_member", [
+    "Metadata/model_settings.config",
+    "Metadata/slice_info.config",
+])
+@pytest.mark.parametrize("contradictory_xml", [
+    # 1. Repeated metadata with same ID key
+    "<config><plate><metadata key='plater_id' value='2'/><metadata key='plater_id' value='1'/></plate></config>",
+    "<config><plate><metadata key='plater_id' value='1'/><metadata key='plater_id' value='2'/></plate></config>",
+    "<config><plate><metadata key='index' value='2'/><metadata key='index' value='1'/></plate></config>",
+    "<config><plate><metadata key='index' value='1'/><metadata key='index' value='2'/></plate></config>",
+    # 2. Recognized metadata aliases
+    "<config><plate><metadata key='plater_id' value='2'/><metadata key='index' value='1'/></plate></config>",
+    "<config><plate><metadata key='index' value='1'/><metadata key='plater_id' value='2'/></plate></config>",
+    # 3. Metadata versus direct plate attributes
+    "<config><plate plater_id='2'><metadata key='plater_id' value='1'/></plate></config>",
+    "<config><plate plater_id='1'><metadata key='plater_id' value='2'/></plate></config>",
+    "<config><plate index='2'><metadata key='plater_id' value='1'/></plate></config>",
+    "<config><plate plater_id='2'><metadata key='index' value='1'/></plate></config>",
+    "<config><plate index='1'><metadata key='plater_id' value='2'/></plate></config>",
+    # 4. Direct attribute aliases
+    "<config><plate plater_id='2' index='1'/></config>",
+    "<config><plate plater_id='1' index='2'/></config>",
+    "<config xmlns:bbl='http://bbl'><plate bbl:plater_id='2' bbl:index='1'/></config>",
+])
+def test_reject_contradictory_selector_sources(tmp_path, config_member, contradictory_xml):
+    path = _write_3mf(tmp_path, {
+        "3D/3dmodel.model": MODEL_XML,
+        config_member: contradictory_xml,
+    })
+    with pytest.raises(archives.ArchiveError) as err:
+        threemf.inspect_layout(path, max_uncompressed=1024 * 1024)
+    assert err.value.status == 400
+
+
+@pytest.mark.parametrize("config_member", [
+    "Metadata/model_settings.config",
+    "Metadata/slice_info.config",
+])
+@pytest.mark.parametrize("valid_alias_xml", [
+    "<config><plate plater_id='1' index='1'/></config>",
+    "<config><plate><metadata key='plater_id' value='1'/><metadata key='index' value='1'/></plate></config>",
+    "<config><plate plater_id='1'><metadata key='plater_id' value='1'/></plate></config>",
+    "<config><plate plater_id='1'><metadata key='index' value='1'/></plate></config>",
+    "<config><plate index='1'><metadata key='plater_id' value='1'/></plate></config>",
+    "<config><plate><metadata key='plater_id' value='1'/><metadata key='plater_id' value='1'/></plate></config>",
+])
+def test_preserve_valid_selector_aliases(tmp_path, config_member, valid_alias_xml):
+    path = _write_3mf(tmp_path, {
+        "3D/3dmodel.model": MODEL_XML,
+        config_member: valid_alias_xml,
+    })
+    layout = threemf.inspect_layout(path, max_uncompressed=1024 * 1024)
+    assert layout == threemf.ThreeMfLayout(kind="project", plates=(threemf.ThreeMfPlate(1),))
+
+
+def test_fallback_label_attribute_handling(tmp_path):
+    # Regression input from review: <config><plate index="1" plater_name="Lid"/></config>
+    p1 = _write_3mf(tmp_path, {
+        "3D/3dmodel.model": MODEL_XML,
+        "Metadata/slice_info.config": '<config><plate index="1" plater_name="Lid"/></config>',
+    }, "p1.3mf")
+    layout1 = threemf.inspect_layout(p1, max_uncompressed=1024 * 1024)
+    assert layout1 == threemf.ThreeMfLayout(kind="project", plates=(threemf.ThreeMfPlate(1, "Lid"),))
+
+    # Name attribute on plate
+    p2 = _write_3mf(tmp_path, {
+        "3D/3dmodel.model": MODEL_XML,
+        "Metadata/slice_info.config": '<config><plate index="1" name="Lid"/></config>',
+    }, "p2.3mf")
+    layout2 = threemf.inspect_layout(p2, max_uncompressed=1024 * 1024)
+    assert layout2 == threemf.ThreeMfLayout(kind="project", plates=(threemf.ThreeMfPlate(1, "Lid"),))
+
+    # Omitted label
+    p3 = _write_3mf(tmp_path, {
+        "3D/3dmodel.model": MODEL_XML,
+        "Metadata/slice_info.config": '<config><plate index="1"/></config>',
+    }, "p3.3mf")
+    layout3 = threemf.inspect_layout(p3, max_uncompressed=1024 * 1024)
+    assert layout3 == threemf.ThreeMfLayout(kind="project", plates=(threemf.ThreeMfPlate(1, None),))
+
+    # Child metadata with name / plater_name
+    p4 = _write_3mf(tmp_path, {
+        "3D/3dmodel.model": MODEL_XML,
+        "Metadata/slice_info.config": '<config><plate index="1"><metadata key="name" value="Lid"/></plate></config>',
+    }, "p4.3mf")
+    layout4 = threemf.inspect_layout(p4, max_uncompressed=1024 * 1024)
+    assert layout4 == threemf.ThreeMfLayout(kind="project", plates=(threemf.ThreeMfPlate(1, "Lid"),))
+
+    p5 = _write_3mf(tmp_path, {
+        "3D/3dmodel.model": MODEL_XML,
+        "Metadata/slice_info.config": '<config><plate index="1"><metadata key="plater_name" value="Lid"/></plate></config>',
+    }, "p5.3mf")
+    layout5 = threemf.inspect_layout(p5, max_uncompressed=1024 * 1024)
+    assert layout5 == threemf.ThreeMfLayout(kind="project", plates=(threemf.ThreeMfPlate(1, "Lid"),))
+
+    # Namespaced attributes
+    p6 = _write_3mf(tmp_path, {
+        "3D/3dmodel.model": MODEL_XML,
+        "Metadata/slice_info.config": (
+            '<bbl:config xmlns:bbl="http://schemas.bambulab.com/package/2021">'
+            '<bbl:plate bbl:index="1" bbl:plater_name="Lid"/>'
+            '</bbl:config>'
+        ),
+    }, "p6.3mf")
+    layout6 = threemf.inspect_layout(p6, max_uncompressed=1024 * 1024)
+    assert layout6 == threemf.ThreeMfLayout(kind="project", plates=(threemf.ThreeMfPlate(1, "Lid"),))
+
+
+def test_inspect_layout_corrupt_bzip2_normalized(tmp_path):
+    member_name = "3D/3dmodel.model"
+    payload = b"<model><resources/><build/></model>"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_BZIP2) as zf:
+        zf.writestr(member_name, payload)
+    data = bytearray(buf.getvalue())
+    offset = 30 + len(member_name) + 5
+    data[offset] ^= 0xFF
+
+    path = tmp_path / "corrupt_bz2.3mf"
+    path.write_bytes(bytes(data))
+
+    with pytest.raises(archives.ArchiveError) as err:
+        threemf.inspect_layout(path, max_uncompressed=1024 * 1024)
+    assert err.value.status == 400
+

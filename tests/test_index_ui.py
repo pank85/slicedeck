@@ -253,7 +253,8 @@ def test_fit_options_reach_the_options_endpoint_and_a_real_scale_shows_in_the_ro
     assert re.search(r'\$\{\s*scaled === null \? "" :', stats)   # no span at all unless it scaled
     assert "renderJobBody(j)" in function_body(page, "renderJobRow")
     assert "renderJobBody(job, false)" in function_body(page, "setUploadLatest")
-    assert "jobs.map(renderJobRow)" in function_body(page, "refresh")
+    assert "renderJobsList(jobs)" in function_body(page, "refresh")
+    assert "renderJobRow(" in function_body(page, "renderJobGroup")
 
 
 def test_only_supports_and_brim_claim_the_preset_was_updated(page):
@@ -563,7 +564,7 @@ def test_upload_accepts_zip_and_reports_the_archive_member(page):
     assert 'accept=".stl,.3mf,.obj,.zip"' in page
     assert "j.archive" in page
     assert "Saved ${j.archive.member}; awaiting confirmation." in page
-    assert "Found ${createdJobs.length} printable models in ${file.name}; saved ${createdJobs.length} jobs. Nothing sliced. Open Print options for each job." in page
+    assert "Saved ${createdJobs.length} jobs from ${file.name} (models/plates). Nothing sliced. Open Print options for each job." in page
     assert "from ${esc(j.archive.member)}" in page
 
 
@@ -2023,6 +2024,7 @@ def test_upload_async_handler_and_shared_rendering_in_node(page):
 
     upload_fn = "async " + function_body(page, "upload") + "\n}"
     set_print_options = function_body(page, "setPrintOptions") + "\n}"
+    format_plate_label = function_body(page, "formatPlateLabel") + "\n}"
     render_job_body = function_body(page, "renderJobBody") + "\n}"
     fins_summary = function_body(page, "finsSummary") + "\n}"
     esc_fn = page[page.index("const esc ="):page.index("const toast =")].strip()
@@ -2166,6 +2168,7 @@ let transferPhase = false;
 let lastPaint = 0;
 
 {set_print_options}
+{format_plate_label}
 {render_job_body}
 {upload_fn}
 
@@ -2219,7 +2222,7 @@ let lastPaint = 0;
 
   await upload({{ name: "pack.zip", size: 4096 }});
 
-  assert.equal(toasts.some(t => t.msg === "Found 3 printable models in pack.zip; saved 3 jobs. Nothing sliced. Open Print options for each job." && t.ms === 6000), true);
+  assert.equal(toasts.some(t => t.msg === "Saved 3 jobs from pack.zip (models/plates). Nothing sliced. Open Print options for each job." && t.ms === 6000), true);
   assert.equal(printOptionsJobId, null);
   assert.equal(elements.printOptions.hidden, true);
   assert.equal(focused, "jobsTitle");
@@ -2248,7 +2251,7 @@ let lastPaint = 0;
   assert.equal(loadPrintersCalls, 1);
   assert.equal(loadProfileCalls, 1);
   assert.equal(toasts.some(t => t.msg.includes("Profile switched to")), false);
-  assert.equal(toasts.some(t => t.msg === "Found 2 printable models in mixed.zip; saved 2 jobs. Nothing sliced. Open Print options for each job."), true);
+  assert.equal(toasts.some(t => t.msg === "Saved 2 jobs from mixed.zip (models/plates). Nothing sliced. Open Print options for each job."), true);
 
   // 4. Single upload with 3MF
   nextXhrStatus = 200;
@@ -2325,5 +2328,184 @@ let lastPaint = 0;
   console.error(err);
   process.exit(1);
 }});
+"""
+    subprocess.run([node, "-e", js], check=True, capture_output=True, text=True)
+
+
+def test_job_groups_and_plate_rendering_in_node(page):
+    """Exercise grouped job rendering, plate identity, escaping, and delegated actions in Node.js."""
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is unavailable")
+
+    esc_fn = page[page.index("const esc ="):page.index("const toast =")].strip()
+    fmt_fns = page[page.index("const fmtBytes ="):page.index("const kv =")].strip()
+    labels = slice_between(page, "const SLICE_LABELS =", "\n\n/* ---------------- routing").strip()
+    is_slicing = function_body(page, "isSlicing") + "\n}"
+    job_printable = function_body(page, "jobPrintable") + "\n}"
+    fins_summary = function_body(page, "finsSummary") + "\n}"
+    format_plate_label = function_body(page, "formatPlateLabel") + "\n}"
+    render_job_body = function_body(page, "renderJobBody") + "\n}"
+    render_job_row = function_body(page, "renderJobRow") + "\n}"
+    render_job_group = function_body(page, "renderJobGroup") + "\n}"
+    render_jobs_list = function_body(page, "renderJobsList") + "\n}"
+    set_upload_latest = function_body(page, "setUploadLatest") + "\n}"
+    on_job_action = function_body(page, "onJobAction") + "\n}"
+
+    js = f"""
+const assert = require("assert");
+
+{esc_fn}
+{fmt_fns}
+{labels}
+{is_slicing}
+{job_printable}
+{fins_summary}
+{format_plate_label}
+{render_job_body}
+{render_job_row}
+{render_job_group}
+{render_jobs_list}
+
+const makeEl = id => ({{
+  id,
+  hidden: false,
+  innerHTML: "",
+  textContent: "",
+  href: "",
+  disabled: false,
+  dataset: {{}},
+  attrs: {{}},
+  setAttribute(k, v) {{ this.attrs[k] = String(v); }},
+  getAttribute(k) {{ return this.attrs[k] ?? null; }}
+}});
+const elements = {{}};
+for (const id of [
+  "uploadLatest", "uploadLatestBody", "uploadLatestPrint", "uploadLatestGcode",
+  "uploadLatestFromLayer", "uploadLatestPreview", "uploadLatestStl",
+  "uploadLatestReslice", "uploadLatestDelete"
+]) {{
+  elements[id] = makeEl(id);
+}}
+const $ = s => elements[s.slice(1)] || (elements[s.slice(1)] = makeEl(s.slice(1)));
+const reslicePending = new Set();
+
+{set_upload_latest}
+
+let calls = [];
+function printJob(id) {{ calls.push(["print", id]); }}
+function openFromLayer(id) {{ calls.push(["from-layer", id]); }}
+function del(id) {{ calls.push(["delete", id]); }}
+function openPreview(id) {{ calls.push(["preview", id]); }}
+function openStlPreview(id) {{ calls.push(["stl-preview", id]); }}
+function createReslice(id) {{ calls.push(["reslice", id]); }}
+function openJobOptions(id) {{ calls.push(["options", id]); }}
+
+{on_job_action}
+
+// 1. Mixed grouped/ungrouped list + status-based poll reordering + same-filename distinct groups
+const g1 = {{ id: "aaaa11112222", name: "widget.3mf", job_ids: ["g1-a", "g1-b"] }};
+const g2 = {{ id: "bbbb33334444", name: "widget.3mf", job_ids: ["g2-a", "g2-b"] }};
+const mixedJobs = [
+  {{ id: "solo-1", status: "sliced", filename: "solo.stl", upload_bytes: 10, created: "2026-11-04T12:00:00Z" }},
+  // g1-b arrives first in poll because it is slicing, while g1-a is awaiting_confirm
+  {{ id: "g1-b", status: "slicing", filename: "widget.3mf", plate: {{ index: 2, name: "Lid", count: 2 }}, jobGroup: g1, upload_bytes: 20, created: "2026-11-04T12:00:00Z" }},
+  {{ id: "solo-2", status: "awaiting_confirm", filename: "other.stl", upload_bytes: 15, created: "2026-11-04T12:00:00Z" }},
+  {{ id: "g1-a", status: "awaiting_confirm", filename: "widget.3mf", plate: {{ index: 1, name: "Base", count: 2 }}, jobGroup: g1, upload_bytes: 20, created: "2026-11-04T12:00:00Z" }},
+  {{ id: "g2-a", status: "awaiting_confirm", filename: "widget.3mf", plate: {{ index: 1, name: "V2", count: 2 }}, jobGroup: g2, upload_bytes: 25, created: "2026-11-04T12:00:00Z" }},
+  {{ id: "g2-b", status: "awaiting_confirm", filename: "widget.3mf", plate: {{ index: 2, name: null, count: 2 }}, jobGroup: g2, upload_bytes: 25, created: "2026-11-04T12:00:00Z" }}
+];
+
+const mixedHtml = renderJobsList(mixedJobs);
+// Every job appears exactly once, and groups are never nested
+for (const j of mixedJobs) {{
+  assert.equal(mixedHtml.split(`id="job-${{j.id}}"`).length - 1, 1, `expected job ${{j.id}} once`);
+}}
+assert.equal(mixedHtml.split('class="job-group"').length - 1, 2);
+assert.equal(/<section class="job-group"[\\s\\S]*<section class="job-group"[\\s\\S]*<\\/section>[\\s\\S]*<\\/section>/.test(mixedHtml.split('data-group-id="bbbb33334444"')[0]), false);
+
+// Relative order: solo-1 -> g1 (at g1-b's first appearance) -> solo-2 -> g2
+assert.ok(mixedHtml.indexOf('id="job-solo-1"') < mixedHtml.indexOf('data-group-id="aaaa11112222"'));
+assert.ok(mixedHtml.indexOf('data-group-id="aaaa11112222"') < mixedHtml.indexOf('id="job-solo-2"'));
+assert.ok(mixedHtml.indexOf('id="job-solo-2"') < mixedHtml.indexOf('data-group-id="bbbb33334444"'));
+
+// Inside g1, job_ids order puts g1-a before g1-b despite status-based poll order
+const g1Slice = mixedHtml.slice(mixedHtml.indexOf('data-group-id="aaaa11112222"'), mixedHtml.indexOf('data-group-id="bbbb33334444"'));
+assert.ok(g1Slice.indexOf('id="job-g1-a"') < g1Slice.indexOf('id="job-g1-b"'));
+assert.ok(g1Slice.includes("Plate 1 of 2: Base"));
+assert.ok(g1Slice.includes("Plate 2 of 2: Lid"));
+assert.ok(g1Slice.includes("2 jobs"));
+// No group-level destructive/slice/print controls in group heading
+const g1Head = g1Slice.slice(0, g1Slice.indexOf('class="job-group-list"'));
+assert.equal(g1Head.includes("data-act="), false);
+assert.equal(g1Head.includes("<button"), false);
+
+// Plate label also renders in latest-job body
+setUploadLatest(mixedJobs[1]);
+assert.ok(elements.uploadLatestBody.innerHTML.includes("Plate 2 of 2: Lid"));
+
+// 2. Deleted first member: surviving members retain group name and show live/original count
+const partialGroup = {{ id: "cccc55556666", name: "pack.zip", job_ids: ["p1", "p2", "p3"] }};
+const partialHtml = renderJobsList([
+  {{ id: "p2", status: "sliced", filename: "b.stl", jobGroup: partialGroup, upload_bytes: 10, created: "2026-11-04T12:00:00Z" }},
+  {{ id: "p3", status: "awaiting_confirm", filename: "c.stl", jobGroup: partialGroup, upload_bytes: 10, created: "2026-11-04T12:00:00Z" }}
+]);
+assert.ok(partialHtml.includes("pack.zip"));
+assert.ok(partialHtml.includes("2 of 3 jobs"));
+
+// 3. Hostile archive/group/plate text + prototype-named group ID + missing optional fields
+const hostileJobs = [
+  {{
+    id: "h-1",
+    status: "awaiting_confirm",
+    filename: "evil.3mf",
+    plate: {{ index: 1, name: '<img src=x onerror="alert(1)">', count: 2 }},
+    jobGroup: {{ id: "__proto__", name: '<script>alert("grp")</script>' }},
+    upload_bytes: 10,
+    created: "2026-11-04T12:00:00Z"
+  }},
+  {{
+    id: "h-2",
+    status: "awaiting_confirm",
+    filename: "evil.3mf",
+    plate: null,
+    jobGroup: {{ id: "__proto__", name: null, job_ids: null }},
+    upload_bytes: 10,
+    created: "2026-11-04T12:00:00Z"
+  }}
+];
+const hostileHtml = renderJobsList(hostileJobs);
+assert.equal(hostileHtml.includes("<script>"), false);
+assert.equal(hostileHtml.includes("<img"), false);
+assert.ok(hostileHtml.includes("&lt;script&gt;alert(&quot;grp&quot;)&lt;/script&gt;"));
+assert.ok(hostileHtml.includes("Plate 1 of 2: &lt;img src=x onerror=&quot;alert(1)&quot;&gt;"));
+assert.ok(hostileHtml.includes("2 jobs"));
+// Deterministic fallback order when job_ids is missing
+assert.ok(hostileHtml.indexOf('id="job-h-1"') < hostileHtml.indexOf('id="job-h-2"'));
+
+// 4. Delegated actions inside a grouped job row resolve exact target IDs
+const makeClick = (act, ref, rowId) => ({{
+  target: {{
+    closest(sel) {{
+      if (sel === "[data-act]") return act ? {{ dataset: {{ act, ref }} }} : null;
+      if (sel === "article.job") return {{ querySelector: () => null, id: rowId }};
+      return null;
+    }}
+  }}
+}});
+calls = [];
+onJobAction(makeClick("options", "g1-a", "job-g1-a"));
+onJobAction(makeClick("delete", "g1-b", "job-g1-b"));
+onJobAction(makeClick("preview", "solo-1", "job-solo-1"));
+onJobAction(makeClick("print", "solo-1", "job-solo-1"));
+assert.deepEqual(calls, [
+  ["options", "g1-a"],
+  ["delete", "g1-b"],
+  ["preview", "solo-1"],
+  ["print", "solo-1"]
+]);
 """
     subprocess.run([node, "-e", js], check=True, capture_output=True, text=True)

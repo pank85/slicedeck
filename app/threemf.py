@@ -32,9 +32,19 @@ import re
 import shutil
 import zipfile
 import zlib
+import xml.etree.ElementTree as ET
+import xml.parsers.expat as expat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
+
+from archives import (
+    ArchiveError,
+    ZIP_MAX_MEMBERS,
+    _canonical_part,
+    _is_unsafe,
+    validate_archive,
+)
 
 PROJECT_SETTINGS_MEMBER = "Metadata/project_settings.config"
 SLIC3R_PE_MEMBER = "Metadata/Slic3r_PE.config"
@@ -87,6 +97,18 @@ class ThreeMfInfo:
     process: str | None = None
     filaments: tuple[str, ...] = ()
     source: str | None = None
+
+
+@dataclass(frozen=True)
+class ThreeMfPlate:
+    index: int                 # positive, 1-based Orca --slice selector; 0 only for generic fallback
+    name: str | None = None
+
+
+@dataclass(frozen=True)
+class ThreeMfLayout:
+    kind: str                  # exactly "project" or "models"
+    plates: tuple[ThreeMfPlate, ...]
 
 
 # --------------------------------------------------------------------------- reading
@@ -691,3 +713,331 @@ def rewrite_identity(blob: bytes, machine: dict | None,
             return _rezip(archive, replacements, set()), "identity"
     except _MEMBER_READ_ERRORS:
         return blob, "none"
+
+
+# --------------------------------------------------------------------------- layout discovery
+
+def _local(tag: str) -> str:
+    """Element tag without its XML namespace ('{ns}object' -> 'object')."""
+    return tag.rsplit("}", 1)[-1]
+
+
+def _local_attribs(element: ET.Element) -> dict[str, str]:
+    """Element attributes mapped by casefolded local name."""
+    return {k.rsplit("}", 1)[-1].lower(): v for k, v in element.attrib.items()}
+
+
+def _safe_parse_xml(stream: Any, limit: int = MEMBER_MAX_BYTES) -> ET.Element:
+    """Parse XML from stream into an ElementTree root element, strictly rejecting
+    any DOCTYPE or entity declarations, and enforcing expansion byte limit."""
+    builder = ET.TreeBuilder()
+    parser = expat.ParserCreate(namespace_separator="}")
+
+    def forbid_doctype(*args: Any) -> None:
+        raise ArchiveError(400, "XML DOCTYPE declaration is forbidden")
+
+    def forbid_entity(*args: Any) -> None:
+        raise ArchiveError(400, "XML entity declaration is forbidden")
+
+    parser.StartDoctypeDeclHandler = forbid_doctype
+    parser.EntityDeclHandler = forbid_entity
+    parser.ExternalEntityRefHandler = forbid_entity
+
+    def start_element(name: str, attrs: dict[str, str]) -> None:
+        if "}" in name:
+            uri, local = name.split("}", 1)
+            tag = f"{{{uri}}}{local}"
+        else:
+            tag = name
+        ns_attrs = {}
+        for k, v in attrs.items():
+            if "}" in k:
+                uri, local = k.split("}", 1)
+                ns_attrs[f"{{{uri}}}{local}"] = v
+            else:
+                ns_attrs[k] = v
+        builder.start(tag, ns_attrs)
+
+    parser.StartElementHandler = start_element
+    parser.EndElementHandler = builder.end
+    parser.CharacterDataHandler = builder.data
+
+    total = 0
+    while chunk := stream.read(65536):
+        total += len(chunk)
+        if total > limit:
+            raise ArchiveError(413, f"archive member expands to more than {limit} bytes")
+        try:
+            parser.Parse(chunk, False)
+        except ArchiveError:
+            raise
+        except expat.ExpatError as exc:
+            raise ArchiveError(400, f"malformed XML: {exc}") from exc
+    try:
+        parser.Parse(b"", True)
+    except ArchiveError:
+        raise
+    except expat.ExpatError as exc:
+        raise ArchiveError(400, f"malformed XML: {exc}") from exc
+    return builder.close()
+
+
+def _check_xml_validity(stream: Any, limit: int) -> None:
+    """Stream-validate XML without building a full element tree in memory,
+    rejecting DOCTYPE, entity declarations, and malformed XML."""
+    parser = expat.ParserCreate()
+
+    def forbid_doctype(*args: Any) -> None:
+        raise ArchiveError(400, "XML DOCTYPE declaration is forbidden")
+
+    def forbid_entity(*args: Any) -> None:
+        raise ArchiveError(400, "XML entity declaration is forbidden")
+
+    parser.StartDoctypeDeclHandler = forbid_doctype
+    parser.EntityDeclHandler = forbid_entity
+    parser.ExternalEntityRefHandler = forbid_entity
+
+    total = 0
+    while chunk := stream.read(65536):
+        total += len(chunk)
+        if total > limit:
+            raise ArchiveError(413, f"archive member expands to more than {limit} bytes")
+        try:
+            parser.Parse(chunk, False)
+        except ArchiveError:
+            raise
+        except expat.ExpatError as exc:
+            raise ArchiveError(400, f"malformed XML: {exc}") from exc
+    try:
+        parser.Parse(b"", True)
+    except ArchiveError:
+        raise
+    except expat.ExpatError as exc:
+        raise ArchiveError(400, f"malformed XML: {exc}") from exc
+
+
+def _extract_plate_data(plate: ET.Element, default_id_key: str = "plater_id") -> tuple[int, str | None]:
+    """Extract plate index and optional name from a <plate> element.
+
+    Validates all recognized selector sources ('plater_id', 'index') across direct
+    attributes and child <metadata> elements, rejecting missing, non-positive,
+    non-integer, or contradictory selectors with ArchiveError(400).
+    """
+    raw_selectors: list[str] = []
+
+    # 1. Direct plate attributes
+    for raw_k, raw_v in plate.attrib.items():
+        k = raw_k.rsplit("}", 1)[-1].lower()
+        if k in ("plater_id", "index"):
+            raw_selectors.append(raw_v.strip())
+
+    # 2. Child metadata elements
+    for child in plate:
+        if _local(child.tag) == "metadata":
+            key: str | None = None
+            val: str | None = None
+            for raw_k, raw_v in child.attrib.items():
+                k = raw_k.rsplit("}", 1)[-1].lower()
+                if k == "key":
+                    key = raw_v.strip().lower()
+                elif k == "value":
+                    val = raw_v.strip()
+            if key in ("plater_id", "index"):
+                raw_selectors.append(val if val is not None else "")
+            elif key is None:
+                for raw_k, raw_v in child.attrib.items():
+                    k = raw_k.rsplit("}", 1)[-1].lower()
+                    if k in ("plater_id", "index"):
+                        raw_selectors.append(raw_v.strip())
+
+    if not raw_selectors:
+        raise ArchiveError(400, "plate declaration is missing plate index")
+
+    if any(not v for v in raw_selectors):
+        if len(raw_selectors) == 1:
+            raise ArchiveError(400, "plate declaration is missing plate index")
+        raise ArchiveError(400, "contradictory plate selectors declared")
+
+    parsed_ids: list[int] = []
+    for raw in raw_selectors:
+        try:
+            val_int = int(raw)
+        except ValueError:
+            raise ArchiveError(400, f"plate index is not an integer: {raw!r}")
+        if val_int <= 0:
+            raise ArchiveError(400, f"plate index must be positive: {val_int}")
+        parsed_ids.append(val_int)
+
+    if len(set(raw_selectors)) > 1 or len(set(parsed_ids)) > 1:
+        raise ArchiveError(400, f"contradictory plate selectors declared: {raw_selectors}")
+
+    index = parsed_ids[0]
+
+    # 3. Extract optional plate label/name
+    raw_name: str | None = None
+    for child in plate:
+        if _local(child.tag) == "metadata":
+            key = None
+            val = None
+            for raw_k, raw_v in child.attrib.items():
+                k = raw_k.rsplit("}", 1)[-1].lower()
+                if k == "key":
+                    key = raw_v.strip().lower()
+                elif k == "value":
+                    val = raw_v.strip()
+            if key in ("plater_name", "name") and val:
+                raw_name = val
+
+    if raw_name is None:
+        plate_attrs = _local_attribs(plate)
+        if "plater_name" in plate_attrs and plate_attrs["plater_name"].strip():
+            raw_name = plate_attrs["plater_name"].strip()
+        elif "name" in plate_attrs and plate_attrs["name"].strip():
+            raw_name = plate_attrs["name"].strip()
+
+    name = raw_name.strip() if raw_name and raw_name.strip() else None
+    return index, name
+
+
+def _extract_plate_data_slice_info(plate: ET.Element) -> tuple[int, str | None]:
+    """Extract plate index and optional name from a <plate> element in slice_info.config."""
+    return _extract_plate_data(plate, default_id_key="index")
+
+
+def _validate_plates(plates: list[tuple[int, str | None]]) -> tuple[ThreeMfPlate, ...]:
+    if not plates:
+        return (ThreeMfPlate(0),)
+
+    if len(plates) > ZIP_MAX_MEMBERS:
+        raise ArchiveError(413, f"archive has more than {ZIP_MAX_MEMBERS} plates")
+
+    plates_sorted = sorted(plates, key=lambda p: p[0])
+    indices = [p[0] for p in plates_sorted]
+
+    if len(set(indices)) != len(indices):
+        raise ArchiveError(400, "duplicate plate indices declared")
+
+    expected = list(range(1, len(plates) + 1))
+    if indices != expected:
+        raise ArchiveError(
+            400,
+            f"plate indices must be contiguous positive integers starting at 1, found: {indices}",
+        )
+
+    return tuple(ThreeMfPlate(index, name) for index, name in plates_sorted)
+
+
+def inspect_layout(source: Path, *, max_uncompressed: int) -> ThreeMfLayout:
+    """Inspect the layout of a 3MF archive within bounds.
+
+    Returns ThreeMfLayout with kind='project' for native 3MF projects,
+    containing positive 1-based ThreeMfPlate entries (or plate 0 generic fallback),
+    or kind='models' for loose-model archives without a native 3MF model document.
+    """
+    path = Path(source)
+    # 1. Strict archive preflight: structural integrity, entry count, safety, compression, bounds
+    validate_archive(path, max_uncompressed=max_uncompressed)
+
+    # 2. Inspect members for native 3MF model document
+    try:
+        archive = zipfile.ZipFile(path)
+    except (zipfile.BadZipFile, OSError, EOFError) as exc:
+        raise ArchiveError(400, "not a readable .zip archive") from exc
+
+    with archive:
+        name_by_canonical = {_canonical_part(info.filename): info for info in archive.infolist()}
+
+        model_info: zipfile.ZipInfo | None = None
+
+        # Check relationships in _rels/.rels
+        rels_canonical = _canonical_part("_rels/.rels")
+        if rels_canonical in name_by_canonical:
+            rels_info = name_by_canonical[rels_canonical]
+            limit = min(max_uncompressed, MEMBER_MAX_BYTES)
+            with archive.open(rels_info) as stream:
+                rels_root = _safe_parse_xml(stream, limit=limit)
+            targets: list[str] = []
+            for child in rels_root:
+                if _local(child.tag) == "Relationship":
+                    rel_type = child.attrib.get("Type", "").strip().lower()
+                    if rel_type.endswith("/3dmodel") or rel_type == "http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel":
+                        target = child.attrib.get("Target", "").strip()
+                        if target:
+                            targets.append(target)
+            if len(targets) > 1:
+                canon_targets = {_canonical_part(t.lstrip("/")) for t in targets}
+                if len(canon_targets) > 1:
+                    raise ArchiveError(400, "ambiguous or duplicate 3MF model parts in relationships")
+            if targets:
+                target = targets[0]
+                target_clean = target.lstrip("/")
+                if _is_unsafe(target_clean):
+                    raise ArchiveError(400, f"archive member is not safe: {target}")
+                canon_target = _canonical_part(target_clean)
+                if canon_target not in name_by_canonical:
+                    raise ArchiveError(400, f"3MF model part referenced in relationships is missing: {target}")
+                model_info = name_by_canonical[canon_target]
+
+        # If not found via relationships, look in [Content_Types].xml
+        if model_info is None:
+            ct_canonical = _canonical_part("[Content_Types].xml")
+            if ct_canonical in name_by_canonical:
+                ct_info = name_by_canonical[ct_canonical]
+                limit = min(max_uncompressed, MEMBER_MAX_BYTES)
+                with archive.open(ct_info) as stream:
+                    ct_root = _safe_parse_xml(stream, limit=limit)
+                for child in ct_root:
+                    if _local(child.tag) == "Override":
+                        ct_type = child.attrib.get("ContentType", "").strip().lower()
+                        if ct_type == "application/vnd.ms-package.3dmanufacturing-3dmodel+xml":
+                            part_name = child.attrib.get("PartName", "").strip().lstrip("/")
+                            if part_name:
+                                canon_part = _canonical_part(part_name)
+                                if canon_part in name_by_canonical:
+                                    model_info = name_by_canonical[canon_part]
+                                    break
+
+        # If still not found, check standard default 3D/3dmodel.model
+        if model_info is None:
+            default_canonical = _canonical_part("3D/3dmodel.model")
+            if default_canonical in name_by_canonical:
+                model_info = name_by_canonical[default_canonical]
+
+        # If no native model part exists, this is a loose-model container
+        if model_info is None:
+            return ThreeMfLayout(kind="models", plates=())
+
+        # Validate native model part XML validity (no DOCTYPE/entities, valid syntax)
+        with archive.open(model_info) as stream:
+            _check_xml_validity(stream, limit=max_uncompressed)
+
+        # 3. Read plate declarations
+        # First priority: Metadata/model_settings.config (authoritative)
+        ms_canonical = _canonical_part("Metadata/model_settings.config")
+        if ms_canonical in name_by_canonical:
+            ms_info = name_by_canonical[ms_canonical]
+            limit = min(max_uncompressed, MEMBER_MAX_BYTES)
+            with archive.open(ms_info) as stream:
+                ms_root = _safe_parse_xml(stream, limit=limit)
+            plate_elems = [child for child in ms_root if _local(child.tag) == "plate"]
+            if plate_elems:
+                plates = [_extract_plate_data(p, default_id_key="plater_id") for p in plate_elems]
+                validated = _validate_plates(plates)
+                return ThreeMfLayout(kind="project", plates=validated)
+
+        # Second priority: Metadata/slice_info.config (fallback)
+        si_canonical = _canonical_part("Metadata/slice_info.config")
+        if si_canonical in name_by_canonical:
+            si_info = name_by_canonical[si_canonical]
+            limit = min(max_uncompressed, MEMBER_MAX_BYTES)
+            with archive.open(si_info) as stream:
+                si_root = _safe_parse_xml(stream, limit=limit)
+            plate_elems = [child for child in si_root if _local(child.tag) == "plate"]
+            if plate_elems:
+                plates = [_extract_plate_data(p, default_id_key="index") for p in plate_elems]
+                validated = _validate_plates(plates)
+                return ThreeMfLayout(kind="project", plates=validated)
+
+        # Generic single-bed fallback
+        return ThreeMfLayout(kind="project", plates=(ThreeMfPlate(0),))
+

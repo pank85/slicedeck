@@ -33,6 +33,7 @@ import os
 import shutil
 import zipfile
 import zlib
+import lzma
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -54,6 +55,16 @@ _KNOWN_COMPRESSION = {
     zipfile.ZIP_BZIP2,
     zipfile.ZIP_LZMA,
 }
+
+_DECOMPRESSION_ERRORS = (
+    zipfile.BadZipFile,
+    RuntimeError,
+    NotImplementedError,
+    zlib.error,
+    lzma.LZMAError,
+    EOFError,
+    OSError,
+)
 
 
 class ArchiveError(Exception):
@@ -96,11 +107,30 @@ def _is_absolute(name: str) -> bool:
 
 def _is_unsafe(member: str) -> bool:
     name = _posix_name(member)
-    return _is_absolute(name) or ".." in PurePosixPath(name).parts
+    parts = PurePosixPath(name).parts
+    return not parts or _is_absolute(name) or ".." in parts
 
 
 def _is_symlink(info: zipfile.ZipInfo) -> bool:
     return (info.external_attr >> 16) & 0o170000 == 0o120000
+
+
+def _canonical_part(member: str) -> str:
+    """Canonical path for duplicate detection: Windows separators folded,
+    redundant slashes collapsed, dot segments resolved, and casefolded."""
+    name = _posix_name(member)
+    is_dir = name.endswith("/")
+    norm = PurePosixPath(name).as_posix().casefold()
+    return norm + ("/" if is_dir and not norm.endswith("/") else "")
+
+
+def _validate_entry(info: zipfile.ZipInfo) -> None:
+    if _is_unsafe(info.filename):
+        raise ArchiveError(400, f"archive member is not safe: {info.filename}")
+    if _is_symlink(info):
+        raise ArchiveError(400, f"archive member is a symlink: {info.filename}")
+    if info.flag_bits & 0x1 or info.compress_type not in _KNOWN_COMPRESSION:
+        raise _unreadable(info)
 
 
 def _is_skipped(member: str) -> bool:
@@ -178,12 +208,7 @@ def extract_models(archive: Path, dest_dir: Path, *, allowed: set[str],
             if len(infos) > max_members:
                 raise ArchiveError(413, f"archive has more than {max_members} entries")
             for info in infos:
-                if _is_unsafe(info.filename):
-                    raise ArchiveError(400, f"archive member is not safe: {info.filename}")
-                if _is_symlink(info):
-                    raise ArchiveError(400, f"archive member is a symlink: {info.filename}")
-                if info.flag_bits & 0x1 or info.compress_type not in _KNOWN_COMPRESSION:
-                    raise _unreadable(info)
+                _validate_entry(info)
 
             printable = [info for info in infos if _is_model(info, models)]
             considered = [info.filename for info in infos if not _is_skipped(info.filename)]
@@ -216,16 +241,10 @@ def extract_models(archive: Path, dest_dir: Path, *, allowed: set[str],
                 sub = dest_dir / f"{index:02d}"
                 sub.mkdir()
                 created.append(sub)
-                try:
-                    written, nbytes = _extract(
-                        handle, info, sub,
-                        member_limit=max_uncompressed,
-                        remaining=max_uncompressed - spent)
-                except ArchiveError:
-                    raise
-                except (zipfile.BadZipFile, RuntimeError, NotImplementedError,
-                        zlib.error, EOFError) as exc:
-                    raise _unreadable(exc) from exc
+                written, nbytes = _extract(
+                    handle, info, sub,
+                    member_limit=max_uncompressed,
+                    remaining=max_uncompressed - spent)
                 spent += nbytes
                 selections.append(Selection(
                     member=info.filename, written=written, candidates=candidates,
@@ -252,8 +271,19 @@ def _extract(handle: zipfile.ZipFile, info: zipfile.ZipInfo, dest_dir: Path, *,
     part = Path(dest_dir) / (basename + PART_SUFFIX)
     total = 0
     try:
-        with handle.open(info) as src, part.open("wb") as out:
-            while chunk := src.read(CHUNK_BYTES):
+        try:
+            src_cm = handle.open(info)
+        except _DECOMPRESSION_ERRORS as exc:
+            raise _unreadable(exc) from exc
+
+        with src_cm as src, part.open("wb") as out:
+            while True:
+                try:
+                    chunk = src.read(CHUNK_BYTES)
+                except _DECOMPRESSION_ERRORS as exc:
+                    raise _unreadable(exc) from exc
+                if not chunk:
+                    break
                 total += len(chunk)
                 if total > member_limit:
                     raise ArchiveError(413, _member_limit(member_limit))
@@ -266,3 +296,64 @@ def _extract(handle: zipfile.ZipFile, info: zipfile.ZipInfo, dest_dir: Path, *,
         part.unlink(missing_ok=True)
         raise
     return written, total
+
+
+def validate_archive(archive: Path, *, max_uncompressed: int,
+                     max_members: int = ZIP_MAX_MEMBERS) -> None:
+    """Validate that ``archive`` is a well-formed, safe zip within bounds.
+
+    Applies all-entry name/type/compression checks, member-count cap,
+    duplicate canonical path detection, and stream-discards archive contents
+    with declared and actual per-member and aggregate decompression bounds.
+    """
+    archive_path = Path(archive)
+    try:
+        handle = zipfile.ZipFile(archive_path)
+    except (zipfile.BadZipFile, OSError, EOFError) as exc:
+        raise _unreadable(exc) from exc
+
+    with handle:
+        infos = handle.infolist()
+        if len(infos) > max_members:
+            raise ArchiveError(413, f"archive has more than {max_members} entries")
+
+        seen_canonical: set[str] = set()
+        declared_total = 0
+        for info in infos:
+            _validate_entry(info)
+
+            canonical = _canonical_part(info.filename)
+            if canonical in seen_canonical:
+                raise ArchiveError(400, f"duplicate archive member: {info.filename}")
+            seen_canonical.add(canonical)
+
+            if info.file_size > max_uncompressed:
+                raise ArchiveError(413, _member_limit(max_uncompressed))
+            declared_total += info.file_size
+            if declared_total > max_uncompressed:
+                raise ArchiveError(413, _aggregate_limit(max_uncompressed))
+
+        streamed_total = 0
+        for info in infos:
+            streamed_member = 0
+            try:
+                src_cm = handle.open(info)
+            except _DECOMPRESSION_ERRORS as exc:
+                raise _unreadable(exc) from exc
+
+            with src_cm as src:
+                while True:
+                    try:
+                        chunk = src.read(CHUNK_BYTES)
+                    except _DECOMPRESSION_ERRORS as exc:
+                        raise _unreadable(exc) from exc
+                    if not chunk:
+                        break
+                    chunk_len = len(chunk)
+                    streamed_member += chunk_len
+                    streamed_total += chunk_len
+                    if streamed_member > max_uncompressed:
+                        raise ArchiveError(413, _member_limit(max_uncompressed))
+                    if streamed_total > max_uncompressed:
+                        raise ArchiveError(413, _aggregate_limit(max_uncompressed))
+

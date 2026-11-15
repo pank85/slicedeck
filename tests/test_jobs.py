@@ -7,6 +7,7 @@ built without its context manager, so the lifespan never starts the slicing work
 """
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import hashlib
 import io
@@ -166,10 +167,10 @@ def test_upload_stores_the_output_name(storage, api_client, cube_stl):
     assert job["status"] == "awaiting_confirm"
 
 
-def test_upload_without_output_name_uses_the_model_stem(storage, api_client, cube_stl):
+def test_upload_without_output_name_uses_the_model_stem(storage, api_client, three_mf_bytes):
     jobs, _sliced = storage
 
-    jid = upload(api_client, cube_stl, filename="dragon.3mf").json()["id"]
+    jid = upload(api_client, three_mf_bytes(), filename="dragon.3mf").json()["id"]
 
     assert read_job(jobs, jid)["output_name"] == "dragon"
 
@@ -1162,6 +1163,26 @@ def _tree_bytes(directory: Path) -> dict[str, bytes]:
             for path in sorted(directory.rglob("*")) if path.is_file()}
 
 
+def _native_plates(three_mf_bytes, count: int) -> bytes:
+    plates = "".join(
+        f'<plate><metadata key="plater_id" value="{n}"/>'
+        f'<metadata key="plater_name" value="Bed {n}"/>'
+        f'<model_instance><metadata key="object_id" value="{n}"/></model_instance></plate>'
+        for n in reversed(range(1, count + 1)))
+    return three_mf_bytes(model_members=False, extra={
+        "Metadata/model_settings.config": f"<config>{plates}</config>",
+        "3D/Objects/component.model": "<model><resources/></model>",
+    })
+
+
+def _replace_zip_member(blob: bytes, name: str, content: bytes) -> bytes:
+    result = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(blob)) as source, zipfile.ZipFile(result, "w") as dest:
+        for info in source.infolist():
+            dest.writestr(info, content if info.filename == name else source.read(info.filename))
+    return result.getvalue()
+
+
 def _forbid_slicer(monkeypatch: pytest.MonkeyPatch) -> None:
     def explode(*_args, **_kwargs):
         raise AssertionError("slicer or fin CLI invoked during upload")
@@ -1229,6 +1250,10 @@ def test_zip_members_confirm_independently(storage, api_client, switchable, zip_
     archive = zip_bytes({"a.stl": b"aaa", "b.stl": b"bbb", "c.stl": b"ccc"})
     body = upload(api_client, archive, filename="three.zip").json()
     ids = [item["id"] for item in body["jobs"]]
+    group = body["jobGroup"]
+    assert group == {"id": group["id"], "name": "three.zip", "job_ids": ids}
+    assert all(item["jobGroup"] == read_job(jobs, item["id"])["jobGroup"] == group
+               for item in body["jobs"])
     sibling = _tree_bytes(jobs / ids[1])
     other = _tree_bytes(jobs / ids[2])
 
@@ -1710,3 +1735,249 @@ def test_job_layers_and_from_layer_gcode_and_print(storage, api_client, monkeypa
     assert p_json["z_offset"] == 0.48
     assert "_from_layer2_on_bed.gcode" in p_json["remote_file"]
     assert "BEFORE_LAYER_CHANGE LAYER=0" in uploaded["content"]
+
+
+# ------------------------------------------------------ Native 3MF plate expansion
+@pytest.mark.parametrize("count", [2, 3])
+def test_native_project_expands_complete_independent_plate_jobs(
+        count, storage, api_client, switchable, three_mf_bytes, queue_watch, monkeypatch):
+    jobs, _ = storage
+    _forbid_slicer(monkeypatch)
+    project = _native_plates(three_mf_bytes, count)
+    response = upload(api_client, project, "project.3mf", "Name")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    ids = [item["id"] for item in body["jobs"]]
+    group = body["jobGroup"]
+    assert group == {"id": group["id"], "name": "project.3mf", "job_ids": ids}
+    assert len(group["id"]) == 12 and all(c in "0123456789abcdef" for c in group["id"])
+    assert len(set(ids)) == count and queue_watch.empty()
+    with zipfile.ZipFile(io.BytesIO(project)) as archive:
+        expected_layout = archive.read("Metadata/model_settings.config")
+        component = archive.read("3D/Objects/component.model")
+    for n, (jid, item) in enumerate(zip(ids, body["jobs"]), 1):
+        job = read_job(jobs, jid)
+        assert item["jobGroup"] == job["jobGroup"] == group
+        assert item["plate"] == job["plate"] == {"index": n, "name": f"Bed {n}", "count": count}
+        assert job["output_name"] == f"Name-{n:02d}"
+        assert job["status"] == "awaiting_confirm" and "archive" not in job
+        original = jobs / jid / "upload" / "project.3mf"
+        assert original.read_bytes() == project
+        rewritten = jobs / jid / "upload" / job["slicer_input"]
+        with zipfile.ZipFile(rewritten) as archive:
+            assert archive.read("Metadata/model_settings.config") == expected_layout
+            assert archive.read("3D/Objects/component.model") == component
+        for kind in ("machine", "process", "filament"):
+            raw = (jobs / jid / "pinned" / f"{kind}.json").read_bytes()
+            assert hashlib.sha256(raw).hexdigest() == job["pinned_presets"]["sha256"][kind]
+    # No mutable hard links across sibling jobs.
+    assert len({(jobs / jid / "upload" / "project.3mf").stat().st_ino for jid in ids}) == count
+
+
+def test_generic_project_multiple_build_items_is_one_job_and_stl_unchanged(
+        storage, api_client, switchable, three_mf_bytes, cube_stl, queue_watch):
+    jobs, _ = storage
+    model = (b'<model xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">'
+             b'<resources/><build><item objectid="1"/><item objectid="2"/></build></model>')
+    project = _replace_zip_member(three_mf_bytes(), "3D/3dmodel.model", model)
+    for blob, name in ((project, "generic.3mf"), (cube_stl, "cube.stl")):
+        response = upload(api_client, blob, name)
+        assert response.status_code == 200, response.text
+        body = response.json()
+        job = read_job(jobs, body["id"])
+        assert "jobs" not in body and "jobGroup" not in body and "plate" not in body
+        assert "jobGroup" not in job and "plate" not in job
+        assert job["output_name"] == Path(name).stem
+        assert (jobs / body["id"] / "upload" / name).read_bytes() == blob
+    assert queue_watch.empty()
+
+
+def test_flatten_zip_group_survives_restart_deletion_and_other_uploads(
+        storage, api_client, switchable, three_mf_bytes, zip_bytes, queue_watch):
+    jobs, _ = storage
+    project = _native_plates(three_mf_bytes, 2)
+    archive = zip_bytes({"a.3mf": project, "z.stl": b"model"})
+    first = upload(api_client, archive, "same.zip").json()
+    second = upload(api_client, archive, "same.zip").json()
+    ids = [x["id"] for x in first["jobs"]]
+    group = first["jobGroup"]
+    assert group["name"] == "same.zip" and group["job_ids"] == ids
+    assert second["jobGroup"]["id"] != group["id"]
+    assert [read_job(jobs, jid)["output_name"] for jid in ids] == ["a-01", "a-02", "z-03"]
+    assert [read_job(jobs, jid)["archive"]["member"] for jid in ids] == ["a.3mf", "a.3mf", "z.stl"]
+    assert all(read_job(jobs, jid)["jobGroup"] == group for jid in ids)
+    assert [read_job(jobs, jid).get("plate", {}).get("index") for jid in ids] == [1, 2, None]
+    unrelated = _tree_bytes(jobs / second["id"])
+    assert api_client.delete(f"/api/jobs/{ids[0]}").status_code == 200
+    fresh = TestClient(main.app)
+    listing = fresh.get("/api/jobs").json()
+    assert next(row for row in listing if row["id"] == ids[1])["jobGroup"] == group
+    assert fresh.get(f"/api/jobs/{ids[2]}").json()["jobGroup"] == group
+    assert _tree_bytes(jobs / second["id"]) == unrelated
+    assert queue_staged(fresh, ids[1]).status_code == 200
+    assert queue_watch.get_nowait() == ids[1] and queue_watch.empty()
+
+
+def test_singleton_archive_and_explicit_plate_keep_legacy_envelope(
+        storage, api_client, switchable, three_mf_bytes, zip_bytes):
+    jobs, _ = storage
+    for blob, name, expected in ((zip_bytes({"only.stl": b"solid"}), "one.zip", "only"),
+                                 (_native_plates(three_mf_bytes, 1), "one.3mf", "one")):
+        response = upload(api_client, blob, name)
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert "jobs" not in body and "jobGroup" not in body
+        assert read_job(jobs, body["id"])["output_name"] == expected
+    assert body["plate"] == {"index": 1, "name": "Bed 1", "count": 1}
+
+
+def test_loose_wrapper_and_same_basename_do_not_overwrite_native_member(
+        storage, api_client, switchable, three_mf_bytes, zip_bytes):
+    jobs, _ = storage
+    native = _native_plates(three_mf_bytes, 2)
+    wrapper = zip_bytes({"pack.3mf": native, "z.obj": b"o mesh"})
+    response = upload(api_client, wrapper, "pack.3mf")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    ids = [x["id"] for x in body["jobs"]]
+    assert len(ids) == 3 and all(x["jobGroup"] == body["jobGroup"] for x in body["jobs"])
+    assert (jobs / ids[0] / "upload" / "pack.3mf").read_bytes() == native
+    assert (jobs / ids[0] / "archive" / "pack.3mf").read_bytes() == wrapper
+    assert (jobs / ids[1] / "upload" / "pack.3mf").read_bytes() == native
+    assert (jobs / ids[2] / "upload" / "z.obj").read_bytes() == b"o mesh"
+
+
+def test_nested_loose_wrapper_and_final_fanout_rejected_before_preparation(
+        storage, api_client, switchable, three_mf_bytes, zip_bytes, monkeypatch):
+    jobs, _ = storage
+    monkeypatch.setattr(main, "_pin_model_locked", lambda *_: pytest.fail("must reject before pinning"))
+    inner = zip_bytes({"x.stl": b"x"})
+    nested = upload(api_client, zip_bytes({"nested.3mf": inner}), "outer.zip")
+    assert nested.status_code == 400 and "nested" in nested.json()["detail"]
+    project = _native_plates(three_mf_bytes, 2)
+    many = zip_bytes({f"{n:02d}.3mf": project for n in range(33)})
+    result = upload(api_client, many, "many.zip")
+    assert result.status_code == 413 and "jobs" in result.json()["detail"]
+    assert list(jobs.iterdir()) == []
+
+
+@pytest.mark.parametrize("failure", ["prepare", "publish"])
+def test_native_plate_failure_rolls_back_all_members(
+        failure, storage, api_client, switchable, three_mf_bytes, queue_watch, monkeypatch):
+    jobs, _ = storage
+    make_job(jobs, "abc123abc123", "sliced")
+    before = _tree_bytes(jobs)
+    name = "_pin_model_locked" if failure == "prepare" else "_commit_published_job"
+    real = getattr(main, name)
+    calls = []
+
+    def fail_second(*args):
+        calls.append(args)
+        if len(calls) == 2:
+            raise OSError("later plate failed")
+        return real(*args)
+
+    monkeypatch.setattr(main, name, fail_second)
+    with pytest.raises(OSError, match="later plate failed"):
+        upload(api_client, _native_plates(three_mf_bytes, 2), "native.3mf")
+    assert len(calls) == 2 and _tree_bytes(jobs) == before
+    assert {p.name for p in jobs.iterdir()} == {"abc123abc123"}
+    assert queue_watch.empty()
+
+
+def test_cancelling_plate_upload_joins_preparation_and_removes_scratch(
+        storage, switchable, three_mf_bytes, queue_watch, monkeypatch):
+    jobs, _ = storage
+    started, release = threading.Event(), threading.Event()
+
+    def blocked(pairs):
+        started.set()
+        assert release.wait(5)
+        return []
+
+    monkeypatch.setattr(main, "_prepare_models", blocked)
+
+    async def exercise():
+        file = main.UploadFile(file=io.BytesIO(_native_plates(three_mf_bytes, 2)),
+                               filename="native.3mf")
+        task = asyncio.create_task(main._upload_zip(file, "native.3mf", None))
+        assert await asyncio.to_thread(started.wait, 5)
+        task.cancel()
+        timer = threading.Timer(0.05, release.set)
+        timer.start()
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            timer.join()
+
+    asyncio.run(exercise())
+    assert release.is_set() and list(jobs.iterdir()) == [] and queue_watch.empty()
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_slice_selector_and_rewritten_complete_project(
+        explicit, storage, api_client, switchable, three_mf_bytes, queue_watch, monkeypatch):
+    jobs, sliced = storage
+    blob = _native_plates(three_mf_bytes, 2) if explicit else three_mf_bytes()
+    body = upload(api_client, blob, "project.3mf").json()
+    item = body["jobs"][1] if explicit else body
+    jid = item["id"]
+    assert queue_staged(api_client, jid).status_code == 200
+    observed = {}
+
+    def slicer(cmd, **kwargs):
+        observed["selector"] = cmd[cmd.index("--slice") + 1]
+        observed["src"] = Path(cmd[-1]).read_bytes()
+        out = Path(cmd[cmd.index("--outputdir") + 1])
+        (out / "selected.gcode").write_text("; total filament used [g] = 1\n")
+        (out / "result.json").write_text('{"return_code": 0}')
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(main.subprocess, "run", slicer)
+    main.run_slice(jid)
+    job = read_job(jobs, jid)
+    assert job["status"] == "sliced" and observed["selector"] == ("2" if explicit else "0")
+    assert observed["src"] == (jobs / jid / "upload" / job["slicer_input"]).read_bytes()
+    if explicit:
+        with zipfile.ZipFile(io.BytesIO(observed["src"])) as z:
+            assert b'Bed 2' in z.read("Metadata/model_settings.config")
+            assert "3D/Objects/component.model" in z.namelist()
+    assert (sliced / jid / f'{job["output_name"]}.gcode').exists()
+
+
+@pytest.mark.parametrize("output_count,process_code,result_code", [(0, 0, 0), (2, 0, 0), (1, 1, 0), (1, 0, 7)])
+def test_slice_rejects_ambiguous_or_failed_outputs(
+        output_count, process_code, result_code, storage, api_client, switchable,
+        three_mf_bytes, queue_watch, monkeypatch):
+    jobs, sliced = storage
+    jid = upload(api_client, _native_plates(three_mf_bytes, 2), "project.3mf").json()["jobs"][0]["id"]
+    assert queue_staged(api_client, jid).status_code == 200
+
+    def slicer(cmd, **kwargs):
+        out = Path(cmd[cmd.index("--outputdir") + 1])
+        for n in range(output_count):
+            (out / f"{n}.gcode").write_text("; gcode\n")
+        (out / "result.json").write_text(json.dumps({"return_code": result_code}))
+        return SimpleNamespace(returncode=process_code, stdout="", stderr="failed")
+
+    monkeypatch.setattr(main.subprocess, "run", slicer)
+    main.run_slice(jid)
+    job = read_job(jobs, jid)
+    assert job["status"] == "failed" and "slicer" in job["error"]
+    assert not (sliced / jid).exists()
+
+
+@pytest.mark.parametrize("plate", [{"index": 0, "count": 2}, {"index": True, "count": 2},
+                                   {"index": "2", "count": 2}, {"index": 3, "count": 2},
+                                   {"index": 1, "count": False}, None])
+def test_invalid_persisted_plate_never_reaches_slicer(
+        plate, storage, api_client, switchable, three_mf_bytes, queue_watch, monkeypatch):
+    jobs, _ = storage
+    jid = upload(api_client, _native_plates(three_mf_bytes, 2), "project.3mf").json()["jobs"][0]["id"]
+    assert queue_staged(api_client, jid).status_code == 200
+    main.write_job(jid, plate=plate)
+    monkeypatch.setattr(main.subprocess, "run", lambda *a, **k: pytest.fail("invalid selector launched"))
+    main.run_slice(jid)
+    assert read_job(jobs, jid)["status"] == "failed"
+    assert "invalid plate selector" in read_job(jobs, jid)["error"]

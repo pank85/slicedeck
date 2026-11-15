@@ -8,6 +8,7 @@ the ordinal directories that call created.
 from __future__ import annotations
 
 import io
+import os
 import zipfile
 from pathlib import Path
 
@@ -335,3 +336,408 @@ def test_unreadable_later_member_removes_earlier_outputs(zip_bytes, tmp_path, mo
     assert err.value.status == 400
     assert str(err.value) == "not a readable .zip archive"
     assert [path.name for path in dest.iterdir()] == ["keep.txt"]
+
+
+def test_validate_archive_accepts_valid_archive(zip_bytes, tmp_path):
+    path = _upload(tmp_path, zip_bytes({"model.stl": b"solid", "notes.txt": b"text"}))
+    archives.validate_archive(path, max_uncompressed=1024)
+
+
+def test_validate_archive_rejects_too_many_entries(zip_bytes, tmp_path):
+    crowded = {f"f{i}.txt": b"x" for i in range(archives.ZIP_MAX_MEMBERS + 1)}
+    path = _upload(tmp_path, zip_bytes(crowded))
+    with pytest.raises(archives.ArchiveError) as err:
+        archives.validate_archive(path, max_uncompressed=1024)
+    assert err.value.status == 413
+    assert f"more than {archives.ZIP_MAX_MEMBERS} entries" in str(err.value)
+
+
+def test_validate_archive_rejects_declared_member_limit(zip_bytes, tmp_path):
+    path = _upload(tmp_path, zip_bytes({"part.stl": b"x" * 20}))
+    with pytest.raises(archives.ArchiveError) as err:
+        archives.validate_archive(path, max_uncompressed=10)
+    assert err.value.status == 413
+    assert "archive member expands to more than 10 bytes" in str(err.value)
+
+
+def test_validate_archive_rejects_declared_aggregate_limit(zip_bytes, tmp_path):
+    path = _upload(tmp_path, zip_bytes({"a.stl": b"x" * 6, "b.stl": b"y" * 6}))
+    with pytest.raises(archives.ArchiveError) as err:
+        archives.validate_archive(path, max_uncompressed=10)
+    assert err.value.status == 413
+    assert "archive models expand to more than 10 bytes" in str(err.value)
+
+
+def test_validate_archive_rejects_streamed_member_limit(zip_bytes, tmp_path, monkeypatch):
+    path = _upload(tmp_path, zip_bytes({"part.stl": b"small"}))
+    real_open = zipfile.ZipFile.open
+
+    def open_stub(self, name, *args, **kwargs):
+        src = real_open(self, name, *args, **kwargs)
+        return _Extra(src, b"x" * 20)
+
+    monkeypatch.setattr(zipfile.ZipFile, "open", open_stub)
+    with pytest.raises(archives.ArchiveError) as err:
+        archives.validate_archive(path, max_uncompressed=10)
+    assert err.value.status == 413
+    assert "archive member expands to more than 10 bytes" in str(err.value)
+
+
+def test_validate_archive_rejects_streamed_aggregate_limit(zip_bytes, tmp_path, monkeypatch):
+    path = _upload(tmp_path, zip_bytes({"a.stl": b"aaaa", "b.stl": b"bbbb"}))
+    real_open = zipfile.ZipFile.open
+
+    def open_stub(self, name, *args, **kwargs):
+        src = real_open(self, name, *args, **kwargs)
+        info = name if isinstance(name, zipfile.ZipInfo) else self.getinfo(name)
+        if info.filename == "b.stl":
+            return _Extra(src, b"xxxx")
+        return src
+
+    monkeypatch.setattr(zipfile.ZipFile, "open", open_stub)
+    with pytest.raises(archives.ArchiveError) as err:
+        archives.validate_archive(path, max_uncompressed=10)
+    assert err.value.status == 413
+    assert "archive models expand to more than 10 bytes" in str(err.value)
+
+
+def test_validate_archive_rejects_unsafe_traversal_and_absolute(zip_bytes, zip_bytes_with, tmp_path):
+    evil = _upload(tmp_path, zip_bytes_with({"ok.stl": b"ok"}, traversal_name="../evil.stl"), "evil.zip")
+    with pytest.raises(archives.ArchiveError) as err:
+        archives.validate_archive(evil, max_uncompressed=1024)
+    assert err.value.status == 400
+    assert "archive member is not safe" in str(err.value)
+
+    for bad in ("/abs.stl", "C:\\win.stl"):
+        bad_path = _upload(tmp_path, zip_bytes({bad: b"bad"}), "bad.zip")
+        with pytest.raises(archives.ArchiveError) as err:
+            archives.validate_archive(bad_path, max_uncompressed=1024)
+        assert err.value.status == 400
+        assert "archive member is not safe" in str(err.value)
+
+
+def test_validate_archive_rejects_symlinks(zip_bytes_with, tmp_path):
+    path = _upload(tmp_path, zip_bytes_with({"ok.stl": b"ok"}, symlink_name="link.stl"), "symlink.zip")
+    with pytest.raises(archives.ArchiveError) as err:
+        archives.validate_archive(path, max_uncompressed=1024)
+    assert err.value.status == 400
+    assert "archive member is a symlink: link.stl" in str(err.value)
+
+
+def test_validate_archive_rejects_encryption_and_unknown_compression(tmp_path):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("test.stl", b"data")
+    data = bytearray(buf.getvalue())
+    cd_offset = data.find(b"PK\x01\x02")
+    data[cd_offset + 8] |= 0x1
+    path = _upload(tmp_path, bytes(data), "encrypted.zip")
+    with pytest.raises(archives.ArchiveError) as err:
+        archives.validate_archive(path, max_uncompressed=1024)
+    assert err.value.status == 400
+    assert str(err.value) == "not a readable .zip archive"
+
+    buf2 = io.BytesIO()
+    with zipfile.ZipFile(buf2, "w") as zf:
+        zf.writestr("test.stl", b"data")
+    data2 = bytearray(buf2.getvalue())
+    cd2 = data2.find(b"PK\x01\x02")
+    data2[cd2 + 10] = 99
+    data2[cd2 + 11] = 0
+    path2 = _upload(tmp_path, bytes(data2), "unknown_comp.zip")
+    with pytest.raises(archives.ArchiveError) as err:
+        archives.validate_archive(path2, max_uncompressed=1024)
+    assert err.value.status == 400
+    assert str(err.value) == "not a readable .zip archive"
+
+
+def test_validate_archive_rejects_corrupt_zip_and_crc(zip_bytes, tmp_path):
+    non_zip = _upload(tmp_path, b"not a zip", "corrupt.zip")
+    with pytest.raises(archives.ArchiveError) as err:
+        archives.validate_archive(non_zip, max_uncompressed=1024)
+    assert err.value.status == 400
+    assert str(err.value) == "not a readable .zip archive"
+
+    full = zip_bytes({"test.stl": b"some content here"})
+    truncated = _upload(tmp_path, full[:len(full) // 2], "trunc.zip")
+    with pytest.raises(archives.ArchiveError) as err:
+        archives.validate_archive(truncated, max_uncompressed=1024)
+    assert err.value.status == 400
+    assert str(err.value) == "not a readable .zip archive"
+
+    data = bytearray(full)
+    cd_offset = data.find(b"PK\x01\x02")
+    data[cd_offset + 16] ^= 0xFF
+    bad_crc = _upload(tmp_path, bytes(data), "bad_crc.zip")
+    with pytest.raises(archives.ArchiveError) as err:
+        archives.validate_archive(bad_crc, max_uncompressed=1024)
+    assert err.value.status == 400
+    assert str(err.value) == "not a readable .zip archive"
+
+
+def test_validate_archive_rejects_duplicate_canonical_parts(tmp_path):
+    buf1 = io.BytesIO()
+    with zipfile.ZipFile(buf1, "w") as zf:
+        zf.writestr("part.stl", b"one")
+        zf.writestr("part.stl", b"two")
+    p1 = _upload(tmp_path, buf1.getvalue(), "dup_exact.zip")
+    with pytest.raises(archives.ArchiveError) as err:
+        archives.validate_archive(p1, max_uncompressed=1024)
+    assert err.value.status == 400
+    assert "duplicate archive member" in str(err.value)
+
+    buf2 = io.BytesIO()
+    with zipfile.ZipFile(buf2, "w") as zf:
+        zf.writestr("part.stl", b"one")
+        zf.writestr("PART.STL", b"two")
+    p2 = _upload(tmp_path, buf2.getvalue(), "dup_case.zip")
+    with pytest.raises(archives.ArchiveError) as err:
+        archives.validate_archive(p2, max_uncompressed=1024)
+    assert err.value.status == 400
+    assert "duplicate archive member" in str(err.value)
+
+    buf3 = io.BytesIO()
+    with zipfile.ZipFile(buf3, "w") as zf:
+        zf.writestr("dir/part.stl", b"one")
+        zf.writestr(r"dir\part.stl", b"two")
+    p3 = _upload(tmp_path, buf3.getvalue(), "dup_sep.zip")
+    with pytest.raises(archives.ArchiveError) as err:
+        archives.validate_archive(p3, max_uncompressed=1024)
+    assert err.value.status == 400
+    assert "duplicate archive member" in str(err.value)
+
+    buf4 = io.BytesIO()
+    with zipfile.ZipFile(buf4, "w") as zf:
+        zf.writestr("dir/part.stl", b"one")
+        zf.writestr("dir/./part.stl", b"two")
+    p4 = _upload(tmp_path, buf4.getvalue(), "dup_dot.zip")
+    with pytest.raises(archives.ArchiveError) as err:
+        archives.validate_archive(p4, max_uncompressed=1024)
+    assert err.value.status == 400
+    assert "duplicate archive member" in str(err.value)
+
+
+@pytest.mark.parametrize("compression", [
+    zipfile.ZIP_DEFLATED,
+    zipfile.ZIP_BZIP2,
+    zipfile.ZIP_LZMA,
+])
+def test_validate_archive_corrupt_compressed_streams_normalized(tmp_path, compression):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=compression) as zf:
+        zf.writestr("test.stl", b"solid model\n" * 50)
+    data = bytearray(buf.getvalue())
+    header_offset = 30 + len("test.stl")
+    # XOR into compressed payload
+    data[header_offset + 12] ^= 0xFF
+    path = _upload(tmp_path, bytes(data), f"corrupt_{compression}.zip")
+
+    with pytest.raises(archives.ArchiveError) as err:
+        archives.validate_archive(path, max_uncompressed=1024 * 1024)
+    assert err.value.status == 400
+
+    dest = _dest(tmp_path, f"out_{compression}")
+    with pytest.raises(archives.ArchiveError) as err_ext:
+        archives.extract_models(path, dest, allowed=MODELS, max_uncompressed=1024 * 1024)
+    assert err_ext.value.status == 400
+    _assert_untouched(dest)
+
+
+def test_validate_archive_bzip2_corrupt_reproducer(tmp_path):
+    # Deterministic reproducer from review:
+    # ZIP_BZIP2 archive with member 3D/3dmodel.model containing <model><resources/><build/></model>,
+    # XOR 0xff into byte 30 + len('3D/3dmodel.model') + 5.
+    member_name = "3D/3dmodel.model"
+    payload = b"<model><resources/><build/></model>"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_BZIP2) as zf:
+        zf.writestr(member_name, payload)
+    data = bytearray(buf.getvalue())
+    offset = 30 + len(member_name) + 5
+    data[offset] ^= 0xFF
+    path = _upload(tmp_path, bytes(data), "corrupt_reproducer.zip")
+
+    with pytest.raises(archives.ArchiveError) as err:
+        archives.validate_archive(path, max_uncompressed=1024 * 1024)
+    assert err.value.status == 400
+
+    dest = _dest(tmp_path, "out_reproducer")
+    with pytest.raises(archives.ArchiveError) as err_ext:
+        archives.extract_models(path, dest, allowed={".model"}, max_uncompressed=1024 * 1024)
+    assert err_ext.value.status == 400
+    _assert_untouched(dest)
+
+
+def test_validate_archive_bzip2_limits_raise_413_not_400(tmp_path):
+    # Ensure explicit 413 limits are not swallowed or normalized to 400
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_BZIP2) as zf:
+        zf.writestr("test.stl", b"A" * 1000)
+    path = _upload(tmp_path, buf.getvalue(), "oversized_bzip2.zip")
+
+    with pytest.raises(archives.ArchiveError) as err:
+        archives.validate_archive(path, max_uncompressed=500)
+    assert err.value.status == 413
+    assert "archive member expands to more than 500 bytes" in str(err.value)
+
+    dest = _dest(tmp_path, "out_oversized")
+    with pytest.raises(archives.ArchiveError) as err_ext:
+        archives.extract_models(path, dest, allowed=MODELS, max_uncompressed=500)
+    assert err_ext.value.status == 413
+    _assert_untouched(dest)
+
+
+def test_extract_models_destination_part_open_failure_propagates_original_error(zip_bytes, tmp_path, monkeypatch):
+    blob = zip_bytes({"part.stl": b"solid model\n"})
+    dest = _dest(tmp_path)
+    keep_file = dest / "keep.txt"
+    keep_file.write_text("preserve me")
+
+    real_path_open = Path.open
+
+    def failing_open(self, *args, **kwargs):
+        if str(self).endswith(".part"):
+            raise PermissionError(13, "Permission denied")
+        return real_path_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", failing_open)
+    with pytest.raises(PermissionError) as err:
+        archives.extract_models(_upload(tmp_path, blob), dest, allowed=MODELS, max_uncompressed=CAP)
+
+    assert err.value.errno == 13
+    assert [p.name for p in dest.iterdir()] == ["keep.txt"]
+    assert keep_file.read_text() == "preserve me"
+    assert list(dest.rglob("*.part")) == []
+
+
+def test_extract_models_destination_write_failure_propagates_original_error(zip_bytes, tmp_path, monkeypatch):
+    blob = zip_bytes({"part.stl": b"solid model\n"})
+    dest = _dest(tmp_path)
+    keep_file = dest / "keep.txt"
+    keep_file.write_text("preserve me")
+
+    real_path_open = Path.open
+
+    def failing_open(self, *args, **kwargs):
+        handle = real_path_open(self, *args, **kwargs)
+        if str(self).endswith(".part"):
+            def failing_write(_data):
+                raise OSError(28, "No space left on device")
+            handle.write = failing_write
+        return handle
+
+    monkeypatch.setattr(Path, "open", failing_open)
+    with pytest.raises(OSError) as err:
+        archives.extract_models(_upload(tmp_path, blob), dest, allowed=MODELS, max_uncompressed=CAP)
+
+    assert err.value.errno == 28
+    assert [p.name for p in dest.iterdir()] == ["keep.txt"]
+    assert keep_file.read_text() == "preserve me"
+    assert list(dest.rglob("*.part")) == []
+
+
+def test_extract_models_destination_chmod_failure_propagates_original_error(zip_bytes, tmp_path, monkeypatch):
+    blob = zip_bytes({"part.stl": b"solid model\n"})
+    dest = _dest(tmp_path)
+    keep_file = dest / "keep.txt"
+    keep_file.write_text("preserve me")
+
+    real_chmod = os.chmod
+
+    def failing_chmod(path, mode, *args, **kwargs):
+        if str(path).endswith(".part"):
+            raise PermissionError(13, "Permission denied")
+        return real_chmod(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(os, "chmod", failing_chmod)
+    with pytest.raises(PermissionError) as err:
+        archives.extract_models(_upload(tmp_path, blob), dest, allowed=MODELS, max_uncompressed=CAP)
+
+    assert err.value.errno == 13
+    assert [p.name for p in dest.iterdir()] == ["keep.txt"]
+    assert keep_file.read_text() == "preserve me"
+    assert list(dest.rglob("*.part")) == []
+
+
+def test_extract_models_destination_replace_failure_propagates_original_error(zip_bytes, tmp_path, monkeypatch):
+    blob = zip_bytes({"part.stl": b"solid model\n"})
+    dest = _dest(tmp_path)
+    keep_file = dest / "keep.txt"
+    keep_file.write_text("preserve me")
+
+    real_replace = os.replace
+
+    def failing_replace(src, dst, *args, **kwargs):
+        if str(src).endswith(".part"):
+            raise OSError(28, "No space left on device")
+        return real_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(os, "replace", failing_replace)
+    with pytest.raises(OSError) as err:
+        archives.extract_models(_upload(tmp_path, blob), dest, allowed=MODELS, max_uncompressed=CAP)
+
+    assert err.value.errno == 28
+    assert [p.name for p in dest.iterdir()] == ["keep.txt"]
+    assert keep_file.read_text() == "preserve me"
+    assert list(dest.rglob("*.part")) == []
+
+
+@pytest.mark.parametrize("failure_stage,expected_exc_type,expected_errno", [
+    ("part_open", PermissionError, 13),
+    ("write", OSError, 28),
+    ("chmod", PermissionError, 13),
+    ("replace", OSError, 28),
+])
+def test_extract_models_destination_failure_on_later_model_removes_sibling_outputs(
+    zip_bytes, tmp_path, monkeypatch, failure_stage, expected_exc_type, expected_errno,
+):
+    blob = zip_bytes({"a.stl": b"model a", "b.stl": b"model b"})
+    dest = _dest(tmp_path)
+    keep_file = dest / "keep.txt"
+    keep_file.write_text("preserve me")
+
+    real_path_open = Path.open
+    real_chmod = os.chmod
+    real_replace = os.replace
+
+    if failure_stage == "part_open":
+        def failing_open(self, *args, **kwargs):
+            if "b.stl" in str(self) and str(self).endswith(".part"):
+                raise PermissionError(13, "Permission denied")
+            return real_path_open(self, *args, **kwargs)
+        monkeypatch.setattr(Path, "open", failing_open)
+
+    elif failure_stage == "write":
+        def failing_open(self, *args, **kwargs):
+            handle = real_path_open(self, *args, **kwargs)
+            if "b.stl" in str(self) and str(self).endswith(".part"):
+                def failing_write(_data):
+                    raise OSError(28, "No space left on device")
+                handle.write = failing_write
+            return handle
+        monkeypatch.setattr(Path, "open", failing_open)
+
+    elif failure_stage == "chmod":
+        def failing_chmod(path, mode, *args, **kwargs):
+            if "b.stl" in str(path) and str(path).endswith(".part"):
+                raise PermissionError(13, "Permission denied")
+            return real_chmod(path, mode, *args, **kwargs)
+        monkeypatch.setattr(os, "chmod", failing_chmod)
+
+    elif failure_stage == "replace":
+        def failing_replace(src, dst, *args, **kwargs):
+            if "b.stl" in str(src) and str(src).endswith(".part"):
+                raise OSError(28, "No space left on device")
+            return real_replace(src, dst, *args, **kwargs)
+        monkeypatch.setattr(os, "replace", failing_replace)
+
+    with pytest.raises(expected_exc_type) as err:
+        archives.extract_models(_upload(tmp_path, blob), dest, allowed=MODELS, max_uncompressed=CAP)
+
+    assert err.value.errno == expected_errno
+    # Sibling output 00/a.stl and failed 01/b.stl are removed, keep.txt is preserved
+    assert [p.name for p in dest.iterdir()] == ["keep.txt"]
+    assert keep_file.read_text() == "preserve me"
+    assert list(dest.rglob("*.part")) == []
+
+

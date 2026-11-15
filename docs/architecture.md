@@ -18,11 +18,11 @@ reslice path is described separately below. The seed contents and the preset beh
 | `app/profiles.py` | Preset import, normalisation, derived options preset, machine/process compatibility. See [presets.md](presets.md). |
 | `app/printers.py` | Printer store (`printers.json` + Fernet-encrypted keys), the env seed row, pairing validation. |
 | `app/moonraker.py` | Moonraker HTTP client; maps transport/HTTP failures onto `MoonrakerError` subclasses carrying `http_status` (`moonraker.py:46-69`). |
-| `app/threemf.py` | Reads a 3MF's embedded printer/process identity and rewrites a job-local copy that names local presets. |
+| `app/threemf.py` | Strictly inspects native 3MF layouts and plate selectors; reads identity and rewrites a job-local copy that names local presets. |
 | `app/supportfins.py` | Wraps the bundled `app/support_fins.mjs`: `available()`/`unavailable_reason()`, and `fin_model()` — one `node` run with `--json`, bounded by `SUPPORT_FINS_TIMEOUT`, serialised by `_RUN_LOCK`, failures as `SupportFinsError`/`SupportFinsUnavailable`. |
 | `app/preview.py` | Reads a job's 3MF/STL/OBJ geometry for the rotatable pre-slice preview (`read_scene`), capped by `MAX_TRIANGLES` (450 000) and `MAX_BYTES` (32 MiB). |
 | `app/shot.py` | Paints front and side PNGs when the finned file is over that byte cap, up to 150 MiB. The slice still uses the original file. |
-| `app/archives.py` | Picks one model out of an uploaded `.zip`, fail-closed on hostile members. |
+| `app/archives.py` | Safely extracts ordered model members from containers and bounds strict 3MF archive preflight. |
 | `app/gcode.py` | Parses the slicer's gcode header for grams/time/layers (`MAX_HEAD_BYTES = 2_000_000`). |
 | `app/index.html` | The whole UI, inline CSS/JS. Served by `GET /`. |
 
@@ -38,16 +38,16 @@ sequenceDiagram
     participant M as Moonraker
 
     B->>F: POST /api/upload (multipart file)
-    F->>F: reject_oversize → suffix check → require_machine()
-    F->>D: jobs/<jid>/upload/<name>
-    F->>F: profile_snapshot() (machine/process/filament + options)
-    F->>D: jobs/<jid>/job.json {"status":"awaiting_confirm", ...}
-    F-->>B: 200 {"id","status":"awaiting_confirm"}
+    F->>F: reject_oversize → suffix check → require_selection()
+    F->>D: private upload scratch; inspect and expand plates/members
+    F->>F: ordered prepare: identity rewrite + per-job snapshot/pins
+    F->>D: atomic publish of staged jobs under STAGE_LOCK
+    F-->>B: 200 {"id","status":"awaiting_confirm", "jobs?", "jobGroup?"}
     B->>F: POST /api/jobs/{jid}/slice (options, fins, resize)
     F->>D: re-pin options, apply resize/fins, job.json {"status":"queued"}
     F->>Q: job_queue.put(jid)
     F-->>B: 200 {"id","status":"queued","queue_position"}
-    Q->>S: orca-slicer --load-settings <machine>;<derived process> --load-filaments <filament>
+    Q->>S: orca-slicer --load-settings <machine>;<process> --load-filaments <filament> --slice <selector>
     S->>D: out/*.gcode + result.json
     Q->>D: move gcode → SLICED_DIR/<jid>/<output_name>.gcode, job.json status=sliced
     B->>F: GET /api/jobs (poll)
@@ -56,42 +56,43 @@ sequenceDiagram
     F-->>B: {"started": true, "remote_file": ...}
 ```
 
-### How one job runs
+### How a batch and its jobs run
 
-1. `api_upload` (`main.py:989`) rejects an oversize body from `Content-Length` before buffering
-   (`reject_oversize`, `main.py:735`), checks the suffix against `ALLOWED = {".stl", ".3mf", ".obj",
-   ".zip"}`, then calls `require_machine()` **before** creating the job directory — a 409 leaves
-   nothing behind (`main.py:997`).
-2. The file is streamed to `jobs/<jid>/upload/<name>` in 1 MiB chunks with a running byte count
-   (`main.py:1005-1011`). A `.zip` is unpacked by `archives.extract_model`; the archive itself stays
-   in the job dir, the extracted member is what gets sliced.
-3. A `.3mf` goes through `prepare_3mf` (`main.py:914`): match the file's printer/process against local
-   presets, select the matching printer, and rewrite the identity into `upload/slice-<stem>.3mf`.
-4. `job.json` is written with `status: "awaiting_confirm"`, the upload name, `profile_snapshot`,
-   `pinned_presets`, and — when relevant — `archive`, `threemf`, `slicer_input`. Slicing happens
-   only when explicitly confirmed via `POST /api/jobs/{jid}/slice`.
-5. The worker thread (`worker`, `main.py:692`) pops the id and runs `run_slice` (`main.py:615`).
-6. `run_slice` sets `status: "slicing"`, resolves the presets (`slice_profile` trusts a job snapshot
-   only when all three paths still resolve inside the datadir, `main.py:593`), writes the derived
-   options preset under `DERIVED_LOCK`, and runs:
+1. `api_upload` checks size, suffix and `require_selection()` before staging. STL/OBJ use the regular
+   singleton path. ZIPs and 3MFs stream into private `.upload-*` scratch, with bounded reads.
+2. `archives.extract_models` extracts ZIP or loose-3MF printable members in deterministic order.
+   `threemf.inspect_layout` strictly validates native packages and their declared contiguous 1-based
+   plate selectors. A native package is never split into its component models; absent plate
+   declarations mean one generic whole-build job. Nested loose wrappers and expansions beyond 64 final
+   jobs are rejected. A ZIP containing a multi-plate project yields a single flattened batch.
+3. Each expanded job gets its own complete model copy. `_prepare_models` processes all copies in
+   flattened order under `DERIVED_LOCK`: native 3MF identity is matched and rewritten, then each
+   job receives its own snapshot, effective preset files and hashes. `_await_prepare` joins its
+   worker even on request cancellation, so cleanup cannot race ongoing writes. The original outer
+   container is retained with the first job, using `archive/` if its basename collides with a model.
+4. After all preparations succeed, `_publish_upload_batch` renames and records every job under
+   `STAGE_LOCK`; any failure rolls back all already-published members. Each explicit plate gets
+   `plate: {index, name, count}`. If and only if there is more than one final job, every member also
+   persists the same `jobGroup: {id, name, job_ids}` as durable original-membership provenance.
+   Singleton envelopes remain unchanged. Members are staged as `awaiting_confirm` and must each be
+   confirmed; listings remain flat and deleting one member does not change another's descriptor.
+5. The worker claims the individually queued job. `run_slice` verifies job-owned pin hashes and
+   copies effective settings to a private temporary directory before launching:
 
    ```text
    <ORCA_BIN> --datadir <ORCA_DATADIR>
-              --load-settings <machine.json>;<system/Custom/process/print-portal-options.json>
-              --load-filaments <filament.json>
-              --slice 0 --outputdir <job>/out <input>
+              --load-settings <pinned machine>;<pinned process>
+              --load-filaments <pinned filament>
+              --slice <plate.index or 0> --outputdir <job>/out <full input>
    ```
 
-   The subprocess gets a hand-built environment (`main.py:630-637`): `PATH`, `HOME=<data>/home`,
-   `QT_QPA_PLATFORM=offscreen`, `DISPLAY=""`, `LC_ALL=C.UTF-8`, `TMPDIR=<data>/tmp`. It does not
-   inherit `MOONRAKER_API_KEY`.
-7. Success moves the first `*.gcode` to `SLICED_DIR/<jid>/<output_name>.gcode`, parses stats with
-   `parse_gcode_stats`, and writes `status: "sliced"`, `elapsed`, `gcode`, `stats`, `layer_height`
-   (`main.py:669-687`). With no gcode the job fails with `result.json`'s `error_string`, else the tail
-   of the slicer's output (`main.py:674-677`).
-8. `POST /api/jobs/{jid}/print` requires `status == "sliced"`, Klipper `webhooks == "ready"` and
-   printer `state` in `("standby", "complete")`, then uploads and starts the print
-   (`main.py:1090-1119`).
+   Positive plate selectors are validated and passed unchanged; legacy/generic jobs use `0`.
+   The subprocess receives only `PATH`, `HOME=<data>/home`, `QT_QPA_PLATFORM=offscreen`,
+   `DISPLAY=""`, `LC_ALL=C.UTF-8` and `TMPDIR=<data>/tmp`; it does not inherit `MOONRAKER_API_KEY`.
+   Both process and available `result.json` must succeed and exactly one G-code file must exist.
+   Only then is it moved to `SLICED_DIR/<jid>/<output_name>.gcode` and the job marked `sliced`.
+6. `POST /api/jobs/{jid}/print` separately checks the printer is ready and idle, then uploads and
+   starts the print. Slicing itself never prints.
 
 ### Job state
 
@@ -130,7 +131,8 @@ finished one but is excluded from age pruning via PRUNE_KEEP_STATUSES, including
 working upload and baseline. A request UUID makes retries for that source idempotent while the child
 exists. Source status, G-code and print metadata are not transferred or changed. ZIP uploads use the
 selected model; finned geometry and earlier manual scaling are retained, whereas source CLI
-orientation and auto-fit are recalculated. The child can outlive the source. Staged children can be
+orientation and auto-fit are recalculated. A child retains its source `plate` selector but not the
+original upload `jobGroup`; it can outlive the source. Staged children can be
 resumed or deleted, are excluded from age pruning, and are also included in bulk deletion. Finished
 jobs are subject to `KEEP_JOBS`; pruning removes job directories, not the separate sliced-output
 copy. Active jobs and print uploads are protected from deletion and pruning.
@@ -139,7 +141,9 @@ A child starts with source preset paths and slicing options, not historical pres
 settings and geometry edits use a revision; stale operations fail rather than overwrite a newer draft.
 Resize modifies only the child, uniformly in millimetres, and reset restores its baseline. Preview
 parsing has byte, expanded ZIP, triangle and component-depth bounds and does not support external
-3MF references. A failed preview need not prevent settings-only slicing. On confirmation, the portal
+3MF references. For a multi-plate source, whole-scene preview, resizing and fins are rejected before
+mutating the job; reset can restore the baseline while still reporting preview unavailable. A failed
+preview need not prevent settings-only slicing. On confirmation, the portal
 validates the local choices and writes job-owned machine, effective process and filament files with
 hashes, plus a prepared 3MF when needed. The worker uses those files rather than the legacy live-profile
 fallback. This pins directly loaded files, not the full datadir or embedded project/object overrides.
@@ -149,9 +153,10 @@ and fin orientation is suppressed. Queueing does not start printing.
 ### Concurrency
 
 One daemon thread (`worker`) consumes `queue.Queue`; slices are therefore serialised. `DERIVED_LOCK`
-(`main.py:94`) spans writing the derived process preset, building the argv and running the slicer, so
-a concurrent options save cannot replace the file a running slicer is loading. `STAGE_LOCK`
-serializes job lifecycle changes and revision checks within the process; it is not a distributed lock.
+protects ordered preparation and effective preset capture, but is released before the slicer launches;
+private per-job pins and temporary copies prevent concurrent option saves from changing a running
+slice. `STAGE_LOCK` serializes batch publication, job lifecycle changes and revision checks within the
+process; it is not a distributed lock.
 The worker claims queued jobs once, and print uploads hold an in-memory deletion pin.
 
 ## What lives in `data/` vs the image

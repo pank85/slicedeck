@@ -2699,8 +2699,8 @@ function renderJobRow(j) {
                  stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M4 21h16"/></svg>
             Gcode
           </a>` : "";
-  /* available before slice; the dialog says so when this job has no STL */
-  const stlPreview = `
+  /* available before slice for non-3MF jobs; the dialog says so when this job has no STL */
+  const stlPreview = /\.3mf$/i.test(j.filename || "") ? "" : `
           <button type="button" class="btn" data-act="stl-preview" data-ref="${esc(j.id)}" aria-label="STL preview of ${esc(j.filename || "this job")}">
             <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
                  stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 4 7.5v9L12 21l8-4.5v-9L12 3Z"/><path d="M12 12 4 7.5"/><path d="M12 12l8-4.5"/><path d="M12 12v9"/></svg>
@@ -3406,6 +3406,12 @@ async function openPreview(id, returnFocus = document.activeElement) {
           }
           if (layerNum) layerNum.textContent = String(totalLayers);
           if (layerTot) layerTot.textContent = String(totalLayers);
+          const layersArr = previewGcodeInstance.layers;
+          const lastLayer = Array.isArray(layersArr) && layersArr.length ? layersArr[layersArr.length - 1] : null;
+          if (lastLayer && Number.isFinite(lastLayer.z)) {
+            const h = `Height ${lastLayer.z.toFixed(1)} mm`;
+            stats.textContent = stats.textContent ? `${stats.textContent} · ${h}` : h;
+          }
         }
         if (previewLoader) previewLoader.hidden = true;
         fallback.hidden = true; fallback.textContent = "";

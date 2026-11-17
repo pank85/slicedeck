@@ -32,7 +32,7 @@ def test_only_the_api_key_is_required(env):
     assert cfg.jobs_dir == Path("/data/jobs")
     assert cfg.home_dir == Path("/data/home")
     assert cfg.profile_file == Path("/data/profile.json")
-    assert cfg.max_upload_bytes == 150 * 1024 * 1024
+    assert cfg.max_upload_bytes == 500 * 1024 * 1024
     assert cfg.keep_jobs == 25
     assert cfg.slice_timeout == 900
     assert cfg.support_fins_timeout == 300.0

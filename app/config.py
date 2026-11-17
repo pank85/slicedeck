@@ -28,7 +28,7 @@ DEFAULTS: dict[str, str] = {
     "PORT": "8088",
     "DATA_DIR": "/data",
     "ORCA_BIN": "/opt/orca/bin/orca-slicer",
-    "MAX_UPLOAD_MB": "150",
+    "MAX_UPLOAD_MB": "500",
     "KEEP_JOBS": "25",
     "SLICE_TIMEOUT": "900",
     "SUPPORT_FINS_TIMEOUT": "300",

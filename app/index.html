@@ -1125,6 +1125,31 @@ input[type=checkbox]{
     #05080E;
   overflow:hidden;
 }
+.preview-loader{
+  position:absolute;
+  inset:0;
+  z-index:3;
+  display:flex;
+  flex-direction:column;
+  align-items:center;
+  justify-content:center;
+  gap:10px;
+  background:rgba(5,8,14,.78);
+  backdrop-filter:blur(3px);
+  color:var(--color-foreground);
+  font-size:var(--text-sm);
+  pointer-events:none;
+}
+.preview-loader[hidden]{ display:none; }
+.preview-spinner{
+  width:28px;
+  height:28px;
+  border-radius:999px;
+  border:3px solid rgba(148,163,184,.25);
+  border-top-color:#38BDF8;
+  animation:preview-spin .8s linear infinite;
+}
+@keyframes preview-spin{ to{ transform:rotate(360deg); } }
 .preview-stage canvas,
 #stlPreviewFrame{ display:block; width:100%; height:100%; border:0; justify-self:stretch; align-self:stretch; background:#1b1b1b; }
 .preview-stage canvas{ touch-action:none; }
@@ -1696,6 +1721,10 @@ input[type=checkbox]{
     <button type="button" class="btn" id="resliceReload" hidden>Reload draft revision</button>
   </div>
   <div class="preview-stage">
+    <div id="previewLoader" class="preview-loader" hidden>
+      <span class="preview-spinner" aria-hidden="true"></span>
+      <span>Loading slice preview…</span>
+    </div>
     <canvas id="previewCanvas" tabindex="0" role="img"
             aria-label="3-D preview of the finned model. Drag to rotate, scroll to zoom, arrow keys to rotate." hidden></canvas>
     <div id="previewShots" class="preview-shots" hidden></div>
@@ -1722,6 +1751,10 @@ input[type=checkbox]{
   <h2 id="stlPreviewTitle" tabindex="-1">STL preview</h2>
   <p id="stlPreviewHint" class="hint">The job's STL, before slicing. Drag to orbit, scroll to zoom.</p>
   <div class="preview-stage">
+    <div id="stlPreviewLoader" class="preview-loader" hidden>
+      <span class="preview-spinner" aria-hidden="true"></span>
+      <span>Loading STL…</span>
+    </div>
     <iframe id="stlPreviewFrame" title="STL model preview" tabindex="0" hidden></iframe>
   </div>
   <p id="stlPreviewError" class="err" role="alert" hidden></p>
@@ -3329,6 +3362,8 @@ async function openPreview(id, returnFocus = document.activeElement) {
       }
       fallback.textContent = "Loading G-code toolpath…";
       fallback.hidden = false;
+      const previewLoader = $("#previewLoader");
+      if (previewLoader) previewLoader.hidden = false;
       try {
         const gr = await fetch(`/api/jobs/${encodeURIComponent(id)}/gcode`);
         if (!gr.ok) throw new Error(gr.statusText || "could not fetch G-code");
@@ -3337,7 +3372,13 @@ async function openPreview(id, returnFocus = document.activeElement) {
         if (previewGcodeInstance) {
           if (typeof previewGcodeInstance.clear === "function") previewGcodeInstance.clear();
         } else if (GP && typeof GP.init === "function") {
-          previewGcodeInstance = GP.init({ canvas });
+          previewGcodeInstance = GP.init({
+            canvas,
+            backgroundColor: 0x05080e,
+            extrusionColor: 0xe2e8f0,
+            topLayerColor: 0xf8fafc,
+            lastSegmentColor: 0x38bdf8,
+          });
         }
         if (previewGcodeInstance) {
           if (typeof previewGcodeInstance.processGCode === "function") {
@@ -3366,8 +3407,10 @@ async function openPreview(id, returnFocus = document.activeElement) {
           if (layerNum) layerNum.textContent = String(totalLayers);
           if (layerTot) layerTot.textContent = String(totalLayers);
         }
+        if (previewLoader) previewLoader.hidden = true;
         fallback.hidden = true; fallback.textContent = "";
       } catch (e) {
+        if (previewLoader) previewLoader.hidden = true;
         fallback.textContent = "Toolpath preview could not be loaded: " + e.message;
         fallback.hidden = false;
       }
@@ -3792,6 +3835,7 @@ function cleanupStlPreview() {
   frame.hidden = true;
   frame.removeAttribute("src");
   $("#stlPreviewBusy").hidden = true;
+  if ($("#stlPreviewLoader")) $("#stlPreviewLoader").hidden = true;
   const back = stlPreviewReturnFocus;
   stlPreviewReturnFocus = null;
   if (back && document.contains(back)) back.focus();
@@ -3808,6 +3852,7 @@ async function openStlPreview(id, returnFocus = document.activeElement) {
   $("#stlPreviewTitle").textContent = "STL preview";
   $("#stlPreviewBusy").hidden = false;
   $("#stlPreviewBusy").textContent = "Loading STL…";
+  if ($("#stlPreviewLoader")) $("#stlPreviewLoader").hidden = false;
   frame.hidden = false;
   if (typeof dlg.showModal === "function") { if (!dlg.open) dlg.showModal(); }
   else dlg.setAttribute("open", "");
@@ -3841,6 +3886,7 @@ async function openStlPreview(id, returnFocus = document.activeElement) {
   } finally {
     if (token === stlPreviewToken) {
       $("#stlPreviewBusy").hidden = true;
+  if ($("#stlPreviewLoader")) $("#stlPreviewLoader").hidden = true;
       stlPreviewBusy = false;
     }
   }
